@@ -1,0 +1,125 @@
+# Vision AI v6 — SCRFD + ArcFace + ByteTrack Pipeline
+
+camera:
+  index: 0
+  width: 640
+  height: 480
+  api: null
+
+detector:
+  type: scrfd
+  model_name: "buffalo_s"        # InsightFace 模型包名 (buffalo_s / buffalo_l)
+  input_size: 640
+  conf_threshold: 0.5
+  nms_threshold: 0.4
+  detection_interval: 2         # 每N帧检测一次(1=每帧,2=推荐,5=极致FPS)
+  device: "cuda"                # cuda / cpu
+
+recognition:
+  model_name: "buffalo_s"       # buffalo_s(更快) / buffalo_l(精准)
+  recognition_threshold: 0.70
+  recognition_cooldown: 300     # 未识别者重试冷却 (帧)
+  recognized_cooldown: 600      # 已识别者重验证冷却 (帧)
+  failed_backoff: 90            # 每次失败额外冷却增量 (帧)
+  max_attempts: 20              # 每 track 最大失败次数
+  device: null
+  # Face Quality
+  min_face_size: 48             # 最小人脸边长 (px)
+  blur_threshold: 80            # Laplacian 模糊阈值
+  min_quality_score: 0.55       # 综合质量阈值 [0,1]
+  # Worker
+  max_queue_size: 4             # worker 输入队列上限
+  queue_pressure_threshold: 3   # 队列超过此值触发降级
+  # Embedding Cache
+  enable_embedding_cache: true
+  embedding_cache_ttl: 30       # 缓存有效期 (秒)
+  max_cache_size: 128           # 最大缓存条目
+
+tracking:
+  enabled: true
+  type: iou           # iou (边缘) / bytetrack (桌面需要boxmot)
+  iou_threshold: 0.3
+  max_lost: 15
+  min_hits: 2
+
+pipeline:
+  window_name: "Vision AI"
+  quit_key: "q"
+  fps_window_size: 30
+  worker_queue_size: 8          # 识别队列上限
+
+database:
+  path: "face_db/identities.pkl"
+
+runtime:
+  mode: edge_minimal          # edge_minimal / balanced / desktop
+  use_gpu: true
+  enable_behavior: false
+  enable_event_system: true
+  enable_alert: true
+  enable_reassociation: false
+  enable_region: false
+
+motion:
+  threshold: 2.0
+  history: 0
+  force_interval: 15
+
+behavior:
+  stationary_threshold: 60     # 静止多少帧触发 stationary
+  loitering_threshold: 300     # 静止多少帧触发 loitering
+  alert_cooldown: 30           # 同事件告警冷却(秒)
+
+regions:
+  restricted:
+    - name: "server_room"
+      points: [[500, 0], [640, 0], [640, 200], [500, 200]]
+  loitering_zone:
+    - name: "entrance"
+      points: [[150, 200], [350, 200], [350, 300], [150, 300]]
+
+# === 后续扩展预留 ===
+
+# === VisionTask Plugins ===
+
+tasks:
+  fall_detection:
+    enabled: true                     # 开启摔倒检测
+    model_path: "models/yolov8n-pose.onnx"
+    device: "auto"                    # auto / cpu / cuda
+    backend: "onnx"                   # onnx / ultralytics (ONNX 适合边缘设备)
+    interval: 5                       # 每 N 帧推理一次
+    input_size: 640
+    confidence_threshold: 0.5
+    roi_min_height: 150               # bbox 高度 < 150px 跳过
+
+    # 摔倒判断参数 (注入到 fall_engine 模块)
+    fall:
+      horizontal_ar_threshold: 0.6
+      angle_threshold: 120
+      torso_inclination_threshold: 65
+      min_fall_pose_duration: 3.5
+      re_threshold: 20
+      gf_threshold: 8000
+      head_descent_threshold: 0.2
+      window_size: 10
+      window_trigger_ratio: 0.5
+      min_consecutive_triggers: 3
+      min_standing_ar: 1.2
+      min_bbox_area: 3000
+      ema_alpha: 0.3
+      sg_window: 7
+      sg_polyorder: 2
+    features:
+      head_descent_window: 20
+      head_descent_min_pixels: 15
+    tracking:
+      ghost_timeout: 3.0
+      fallen_ghost_timeout: 5.0
+      distance_threshold: 150
+      history_length: 36
+    cross_camera:
+      hist_threshold: 0.5
+    camera_process:
+      roi_conf: 0.25
+      roi_enabled: true

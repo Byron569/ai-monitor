@@ -1,0 +1,23 @@
+# Multi-Camera Configuration
+# 用法: python main.py --multi-camera configs/cameras.yaml
+
+cameras:
+  - id: cam0
+    source: 0
+    profile: edge_minimal
+
+  - id: cam1
+    source: 1
+    profile: edge_minimal
+
+  # - id: front_gate
+  #   source: rtsp://192.168.1.20/live
+  #   profile: balanced
+
+  # - id: lobby
+  #   source: videos/test.mp4
+  #   profile: balanced
+
+# Global inference scheduler
+scheduler:
+  max_concurrent_detect: 2
