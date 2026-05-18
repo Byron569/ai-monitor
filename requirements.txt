@@ -1,0 +1,7 @@
+# Legacy single-file requirements (kept for backward compatibility)
+# 推荐使用分层依赖:
+#   pip install -r requirements/edge_cpu.txt    # 边缘设备
+#   pip install -r requirements/desktop.txt     # 桌面GPU
+#   pip install -r requirements/dev.txt         # 开发环境
+
+-r requirements/desktop.txt
