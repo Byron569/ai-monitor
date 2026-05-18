@@ -1,0 +1,8 @@
+# Desktop GPU (NVIDIA RTX / GTX / 工作站)
+# 包含 CUDA 推理 + ByteTrack
+-r base.txt
+insightface>=0.7.3
+onnxruntime-gpu>=1.15.0
+boxmot>=10.0.0
+ultralytics>=8.0.0
+lap>=0.4.0

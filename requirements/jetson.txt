@@ -1,0 +1,8 @@
+# Jetson (Orin / Nano / TX2)
+# Jetson 更推荐使用 TensorRT 而非 onnxruntime-gpu
+# 当前占位：onnxruntime-gpu 作为过渡方案
+# 后续计划：替换为 TensorRT engine
+-r base.txt
+insightface>=0.7.3
+# onnxruntime-gpu>=1.15.0  # 如果有预编译 wheel
+# 推荐: 使用 NVIDIA DeepStream + TensorRT
