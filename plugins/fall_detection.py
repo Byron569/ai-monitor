@@ -50,11 +50,14 @@ class FallDetectionTask(VisionTask):
                     input_size=cfg.get("input_size", 640),
                     enable_tracking=False,
                 )
+                tracking_cfg = cfg.get("tracking", {})
                 self._worker = FallDetectionWorker(
                     inference_backend=backend,
                     max_queue_size=2,
                     interval=self.interval,
                     confidence_threshold=cfg.get("confidence_threshold", 0.5),
+                    ghost_timeout=tracking_cfg.get("ghost_timeout", 3.0),
+                    ghost_timeout_fallen=tracking_cfg.get("ghost_timeout_fallen", 30.0),
                 )
                 self._worker.start()
                 logger.info(f"[FallDetection] Worker 启动: backend={cfg.get('backend', 'onnx')} "
@@ -73,6 +76,8 @@ class FallDetectionTask(VisionTask):
         return True  # Worker 自己控制帧间隔
 
     def run(self, frame, tracks: list, context: dict) -> List[VisionEvent]:
+        if not self.enabled or self._worker is None:
+            return []
         events = []
         frame_id = context.get("frame_count", 0)
 

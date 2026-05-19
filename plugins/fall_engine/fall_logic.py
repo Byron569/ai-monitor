@@ -8,35 +8,13 @@ import logging
 import numpy as np
 from scipy.signal import savgol_filter
 from plugins.fall_engine.features import compute_all_features, get_torso_inclination
-from plugins.fall_engine.config import FALL
+from plugins.fall_engine.config import get_config as _get_fall_config
 
 logger = logging.getLogger(__name__)
 
-# 从配置文件读取参数
-HORIZONTAL_AR_THRESHOLD = FALL.get('horizontal_ar_threshold', 0.6)
-ANGLE_THRESHOLD = FALL.get('angle_threshold', 130)
-MIN_FALL_POSE_DURATION = FALL.get('min_fall_pose_duration', 1.0)
-RE_THRESHOLD = FALL.get('re_threshold', 20)
-GF_THRESHOLD = FALL.get('gf_threshold', 8000)
-HEAD_DESCENT_THRESHOLD = FALL.get('head_descent_threshold', 0.2)
-FAST_RE_THRESHOLD = FALL.get('fast_re_threshold', 20)
-FAST_GF_THRESHOLD = FALL.get('fast_gf_threshold', 8000)
-FAST_ANGLE_THRESHOLD = FALL.get('fast_angle_threshold', 120)
-WINDOW_SIZE = FALL.get('window_size', 10)
-WINDOW_TRIGGER_RATIO = FALL.get('window_trigger_ratio', 0.5)
-MIN_STANDING_AR = FALL.get('min_standing_ar', 1.2)
-MIN_BBOX_AREA = FALL.get('min_bbox_area', 3000)
-DUAL_CAM_CONFIRM = FALL.get('dual_cam_confirm', True)
-SINGLE_CAM_FALL_CONFIDENCE = FALL.get('single_cam_fall_confidence', 0.6)
-DUAL_CAM_FALL_CONFIDENCE = FALL.get('dual_cam_fall_confidence', 0.95)
-TORSO_INCLINATION_THRESHOLD = FALL.get('torso_inclination_threshold', 65)
-REBOUND_THRESHOLD = FALL.get('rebound_threshold', 0.3)
-REBOUND_FRAMES = FALL.get('rebound_frames', 2)
-RECOVERY_FRAMES = FALL.get('recovery_frames', 3)
-EMA_ALPHA = FALL.get('ema_alpha', 0.3)
-SG_WINDOW = FALL.get('sg_window', 7)
-SG_POLYORDER = FALL.get('sg_polyorder', 2)
-MIN_CONSECUTIVE_TRIGGERS = FALL.get('min_consecutive_triggers', 3)
+
+def _cfg():
+    return _get_fall_config().fall
 
 
 def calculate_angle(a, b, c):
@@ -69,22 +47,22 @@ def check_rule_based(kp_5, aspect_ratio, angle_keypoints, bbox_area=None, initia
 
     # 规则 1: 宽高比（小目标跳过，用变化量代替绝对值）
     if aspect_ratio is not None:
-        if bbox_area is not None and bbox_area < MIN_BBOX_AREA:
+        if bbox_area is not None and bbox_area < _cfg().get('min_bbox_area', 3000):
             pass  # 小目标宽高比不可靠，跳过
         elif initial_ar is not None and initial_ar > 0:
             ar_ratio = aspect_ratio / initial_ar
             if ar_ratio < 0.35:  # 比站姿扁了 65%
                 ar_triggered = True
-        elif aspect_ratio < HORIZONTAL_AR_THRESHOLD:
+        elif aspect_ratio < _cfg().get('horizontal_ar_threshold', 0.6):
             ar_triggered = True
 
     # 规则 2: 角度判断（躯干倾斜角 OR 三点角度，任一触发即可）
     # 躯干倾斜角：直接反映"人是否倒了"，站立~0°，跌倒>50°
-    if torso_inclination is not None and torso_inclination > TORSO_INCLINATION_THRESHOLD:
+    if torso_inclination is not None and torso_inclination > _cfg().get('torso_inclination_threshold', 65):
         angle_triggered = True
     # 三点角度：反映身体折叠，对蜷缩有独特价值
     elif smoothed_angle is not None and smoothed_angle > 0:
-        if smoothed_angle < ANGLE_THRESHOLD:
+        if smoothed_angle < _cfg().get('angle_threshold', 130):
             angle_triggered = True
     elif angle_keypoints is not None:
         angle = calculate_angle(
@@ -92,7 +70,7 @@ def check_rule_based(kp_5, aspect_ratio, angle_keypoints, bbox_area=None, initia
             angle_keypoints['hip'],
             angle_keypoints['knee']
         )
-        if angle < ANGLE_THRESHOLD:
+        if angle < _cfg().get('angle_threshold', 130):
             angle_triggered = True
 
     # AND 逻辑：两个条件都满足才触发
@@ -113,16 +91,16 @@ def check_physical_features(features):
 
     # 旋转能量突然增大（使用平滑值）
     re_val = features.get('re_smoothed', features.get('re', 0))
-    if re_val > RE_THRESHOLD:
+    if re_val > _cfg().get('re_threshold', 20):
         triggered = True
 
     # 重力因子异常（向下加速，使用平滑值）
     gf_val = features.get('gf_smoothed', features.get('gf', 0))
-    if gf_val > GF_THRESHOLD:
+    if gf_val > _cfg().get('gf_threshold', 8000):
         triggered = True
 
     # 头部持续下降（捕捉慢速滑倒）
-    if features.get('head_descent', 0) > HEAD_DESCENT_THRESHOLD:
+    if features.get('head_descent', 0) > _cfg().get('head_descent_threshold', 0.2):
         triggered = True
 
     return triggered
@@ -167,8 +145,8 @@ def evaluate_fall(person_data, current_time, dual_cam_fall=None):
         raw_gf = features.get('gf', 0)
         prev_smoothed_re = fall_state.get('ema_re', raw_re)
         prev_smoothed_gf = fall_state.get('ema_gf', raw_gf)
-        ema_re = EMA_ALPHA * raw_re + (1 - EMA_ALPHA) * prev_smoothed_re
-        ema_gf = EMA_ALPHA * raw_gf + (1 - EMA_ALPHA) * prev_smoothed_gf
+        ema_re = _cfg().get('ema_alpha', 0.3) * raw_re + (1 - _cfg().get('ema_alpha', 0.3)) * prev_smoothed_re
+        ema_gf = _cfg().get('ema_alpha', 0.3) * raw_gf + (1 - _cfg().get('ema_alpha', 0.3)) * prev_smoothed_gf
         fall_state['ema_re'] = ema_re
         fall_state['ema_gf'] = ema_gf
 
@@ -177,16 +155,16 @@ def evaluate_fall(person_data, current_time, dual_cam_fall=None):
         gf_buf = fall_state.get('gf_buffer', [])
         re_buf.append(ema_re)
         gf_buf.append(ema_gf)
-        if len(re_buf) > SG_WINDOW:
-            re_buf = re_buf[-SG_WINDOW:]
-        if len(gf_buf) > SG_WINDOW:
-            gf_buf = gf_buf[-SG_WINDOW:]
+        if len(re_buf) > _cfg().get('sg_window', 7):
+            re_buf = re_buf[-_cfg().get('sg_window', 7):]
+        if len(gf_buf) > _cfg().get('sg_window', 7):
+            gf_buf = gf_buf[-_cfg().get('sg_window', 7):]
         fall_state['re_buffer'] = re_buf
         fall_state['gf_buffer'] = gf_buf
 
-        if len(re_buf) >= SG_WINDOW:
-            features['re_smoothed'] = float(savgol_filter(re_buf, SG_WINDOW, SG_POLYORDER)[-1])
-            features['gf_smoothed'] = float(savgol_filter(gf_buf, SG_WINDOW, SG_POLYORDER)[-1])
+        if len(re_buf) >= _cfg().get('sg_window', 7):
+            features['re_smoothed'] = float(savgol_filter(re_buf, _cfg().get('sg_window', 7), _cfg().get('sg_polyorder', 2))[-1])
+            features['gf_smoothed'] = float(savgol_filter(gf_buf, _cfg().get('sg_window', 7), _cfg().get('sg_polyorder', 2))[-1])
         else:
             features['re_smoothed'] = ema_re
             features['gf_smoothed'] = ema_gf
@@ -265,10 +243,10 @@ def evaluate_fall(person_data, current_time, dual_cam_fall=None):
               f"HD:{hd:.2f}{hd_info} "
               f"RE:{re_raw:.1f}→{re_s:.1f} GF:{gf_raw:.0f}→{gf_s:.0f} "
               f"hist:{len(fall_state.get('trigger_history', []))} "
-              f"guard:{'BLOCK' if initial_ar is not None and initial_ar < MIN_STANDING_AR else 'OK'}")
+              f"guard:{'BLOCK' if initial_ar is not None and initial_ar < _cfg().get('min_standing_ar', 1.2) else 'OK'}")
 
     # 保护：初始状态不是站立（AR < 1.2）→ 跳过 AR 变化检测，但允许物理特征检测
-    initial_ar_low = initial_ar is not None and initial_ar < MIN_STANDING_AR
+    initial_ar_low = initial_ar is not None and initial_ar < _cfg().get('min_standing_ar', 1.2)
 
     # 三路检测（任一路径触发即为"可能跌倒"）
     current_ar = person_data.get('aspect_ratio')
@@ -299,9 +277,9 @@ def evaluate_fall(person_data, current_time, dual_cam_fall=None):
         if ar_ratio < 0.35:
             ar_dramatic = True
     # 初始 AR 低时：只要当前 AR 很低且有头部下降，也算触发
-    elif initial_ar_low and current_ar is not None and current_ar < HORIZONTAL_AR_THRESHOLD:
+    elif initial_ar_low and current_ar is not None and current_ar < _cfg().get('horizontal_ar_threshold', 0.6):
         ar_dramatic = True
-    head_drop_triggered = features and features.get('head_descent', 0) > HEAD_DESCENT_THRESHOLD
+    head_drop_triggered = features and features.get('head_descent', 0) > _cfg().get('head_descent_threshold', 0.2)
     side_fall_triggered = ar_dramatic and head_drop_triggered
 
     # 路径 4: 已经在地上（AR 极低且持续多帧，无需运动特征）
@@ -336,8 +314,8 @@ def evaluate_fall(person_data, current_time, dual_cam_fall=None):
         fall_state['trigger_history'] = []
 
     fall_state['trigger_history'].append(is_potential_fall)
-    if len(fall_state['trigger_history']) > WINDOW_SIZE:
-        fall_state['trigger_history'] = fall_state['trigger_history'][-WINDOW_SIZE:]
+    if len(fall_state['trigger_history']) > _cfg().get('window_size', 10):
+        fall_state['trigger_history'] = fall_state['trigger_history'][-_cfg().get('window_size', 10):]
 
     # 连续触发帧计数（允许 1 帧间隙，防止倒地过程中检测框抖动导致计数归零）
     if is_potential_fall:
@@ -350,8 +328,8 @@ def evaluate_fall(person_data, current_time, dual_cam_fall=None):
             fall_state['consecutive_triggers'] = 0
 
     trigger_ratio = sum(fall_state['trigger_history']) / len(fall_state['trigger_history'])
-    consecutive_ok = fall_state.get('consecutive_triggers', 0) >= MIN_CONSECUTIVE_TRIGGERS
-    window_triggered = trigger_ratio >= WINDOW_TRIGGER_RATIO and consecutive_ok
+    consecutive_ok = fall_state.get('consecutive_triggers', 0) >= _cfg().get('min_consecutive_triggers', 3)
+    window_triggered = trigger_ratio >= _cfg().get('window_trigger_ratio', 0.5) and consecutive_ok
 
     if window_triggered:
         if not fall_state['is_potential_fall']:
@@ -367,7 +345,7 @@ def evaluate_fall(person_data, current_time, dual_cam_fall=None):
         # 已确认跌倒后，滑动窗口失效不应重置状态（人躺在地上时物理信号会消失）
         if not fall_state.get('fall_detected', False):
             fst = fall_state.get('fall_start_time')
-            if fst is not None and current_time - fst < MIN_FALL_POSE_DURATION - 0.01:
+            if fst is not None and current_time - fst < _cfg().get('min_fall_pose_duration', 1.0) - 0.01:
                 # fall_start_time 已设置但持续时间未到 → 保持状态，给人倒下后静止的场景留时间
                 pass
             elif fall_state['is_potential_fall']:
@@ -388,7 +366,7 @@ def evaluate_fall(person_data, current_time, dual_cam_fall=None):
         fst_for_check = None
     if fst_for_check is not None:
         duration = current_time - fall_state['fall_start_time']
-        if duration >= MIN_FALL_POSE_DURATION - 0.01:  # 浮点精度容差
+        if duration >= _cfg().get('min_fall_pose_duration', 1.0) - 0.01:  # 浮点精度容差
             # 检查头部是否已回弹（弯腰后站起 vs 真正摔倒）
             # 需要连续多帧回弹才判定，防止单帧噪声取消跌倒
             curr_kp = person_data.get('kp_5')
@@ -396,14 +374,14 @@ def evaluate_fall(person_data, current_time, dual_cam_fall=None):
             if curr_kp is not None and 'min_head_y' in fall_state:
                 head_drop = fall_state['min_head_y'] - curr_kp['H'][1]
                 body_h = abs(curr_kp['H'][1] - (curr_kp['KL'][1] + curr_kp['KR'][1]) / 2)
-                if body_h > 10 and head_drop / body_h > REBOUND_THRESHOLD:
+                if body_h > 10 and head_drop / body_h > _cfg().get('rebound_threshold', 0.3):
                     rebound = True
             # 多帧回弹确认
             if rebound:
                 fall_state['rebound_count'] = fall_state.get('rebound_count', 0) + 1
             else:
                 fall_state['rebound_count'] = 0
-            if fall_state.get('rebound_count', 0) < REBOUND_FRAMES:
+            if fall_state.get('rebound_count', 0) < _cfg().get('rebound_frames', 2):
                 fall_detected = True
             else:
                 # 回弹确认 → 不是真正跌倒，清理 fall_start_time
@@ -412,25 +390,25 @@ def evaluate_fall(person_data, current_time, dual_cam_fall=None):
     # 高置信度快速通道：四个条件同时强力触发时，跳过持续时间要求
     if not fall_detected and features is not None:
         ar = person_data.get('aspect_ratio')
-        fast_angle = hip_angle_smoothed > 0 and hip_angle_smoothed < FAST_ANGLE_THRESHOLD
+        fast_angle = hip_angle_smoothed > 0 and hip_angle_smoothed < _cfg().get('fast_angle_threshold', 120)
         re_val = features.get('re_smoothed', features.get('re', 0))
         gf_val = features.get('gf_smoothed', features.get('gf', 0))
 
-        if (ar is not None and ar < HORIZONTAL_AR_THRESHOLD and
+        if (ar is not None and ar < _cfg().get('horizontal_ar_threshold', 0.6) and
             fast_angle and
-            re_val > FAST_RE_THRESHOLD and
-            gf_val > FAST_GF_THRESHOLD):
+            re_val > _cfg().get('fast_re_threshold', 20) and
+            gf_val > _cfg().get('fast_gf_threshold', 15000)):
             fall_detected = True
 
     # 恢复检测：如果已确认跌倒但人站起来了，重置状态
     # 需要连续多帧 AR 恢复才重置，防止单帧噪声误重置
-    if fall_detected and initial_ar is not None and initial_ar > MIN_STANDING_AR:
+    if fall_detected and initial_ar is not None and initial_ar > _cfg().get('min_standing_ar', 1.2):
         current_ar = person_data.get('aspect_ratio')
         if current_ar is not None and current_ar > initial_ar * 0.7:
             fall_state['recovery_count'] = fall_state.get('recovery_count', 0) + 1
         else:
             fall_state['recovery_count'] = 0
-        if fall_state.get('recovery_count', 0) >= RECOVERY_FRAMES:
+        if fall_state.get('recovery_count', 0) >= _cfg().get('recovery_frames', 3):
             fall_detected = False
             fall_state['is_potential_fall'] = False
             fall_state['fall_start_time'] = None
@@ -444,16 +422,16 @@ def evaluate_fall(person_data, current_time, dual_cam_fall=None):
 
     # 确定状态和置信度
     if fall_detected:
-        if DUAL_CAM_CONFIRM and dual_cam_fall is not None:
+        if _cfg().get('dual_cam_confirm', True) and dual_cam_fall is not None:
             # 双摄像头交叉验证
             if dual_cam_fall:
-                confidence = DUAL_CAM_FALL_CONFIDENCE
+                confidence = _cfg().get('dual_cam_fall_confidence', 0.95)
                 state = "FALL (Confirmed)"
             else:
-                confidence = SINGLE_CAM_FALL_CONFIDENCE
+                confidence = _cfg().get('single_cam_fall_confidence', 0.6)
                 state = "FALL (Single Cam)"
         else:
-            confidence = SINGLE_CAM_FALL_CONFIDENCE
+            confidence = _cfg().get('single_cam_fall_confidence', 0.6)
             state = "FALL"
     elif fall_state['is_potential_fall']:
         confidence = 0.3

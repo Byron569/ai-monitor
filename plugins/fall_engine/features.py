@@ -11,11 +11,11 @@
 """
 
 import numpy as np
-from plugins.fall_engine.config import FEATURES as _CFG
+from plugins.fall_engine.config import get_config as _get_fall_config
 
-# 从配置文件读取参数
-HEAD_DESCENT_WINDOW = _CFG.get('head_descent_window', 20)
-HEAD_DESCENT_MIN_PIXELS = _CFG.get('head_descent_min_pixels', 15)
+
+def _fcfg():
+    return _get_fall_config().features
 
 
 def yolo_to_5keypoints(keypoints, confs):
@@ -161,7 +161,7 @@ def get_gf(kp_t2, kp_t1, kp_t0, dt=None):
     return raw
 
 
-def get_head_descent(history, curr_kp, window=HEAD_DESCENT_WINDOW, initial_body_height=None):
+def get_head_descent(history, curr_kp, window=_fcfg().get('head_descent_window', 20), initial_body_height=None):
     """
     头部下降趋势：检测头部在短时间内是否持续下降
     用于捕捉慢速滑倒（旋转能量和重力因子可能不够的场景）
@@ -204,8 +204,8 @@ def get_head_descent(history, curr_kp, window=HEAD_DESCENT_WINDOW, initial_body_
     if body_height < 10:
         return 0
 
-    # 过滤微小抖动（按身体高度比例，约2%身高，最低HEAD_DESCENT_MIN_PIXELS）
-    min_drop = max(HEAD_DESCENT_MIN_PIXELS, 0.02 * body_height)
+    # 过滤微小抖动（按身体高度比例，约2%身高，最低_fcfg().get('head_descent_min_pixels', 15)）
+    min_drop = max(_fcfg().get('head_descent_min_pixels', 15), 0.02 * body_height)
     if head_drop < min_drop:
         return 0
 

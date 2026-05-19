@@ -9,7 +9,6 @@
   <img src="https://img.shields.io/badge/YOLOv8--Pose-ONNX-orange?logo=yolo" alt="YOLOv8-Pose">
   <img src="https://img.shields.io/badge/NCNN-ARM_NEON-blue" alt="NCNN">
   <img src="https://img.shields.io/badge/Edge-Zero_BoxMOT-brightgreen" alt="Edge">
-  <img src="https://img.shields.io/badge/Tests-209/209-brightgreen" alt="Tests">
   <img src="https://img.shields.io/badge/License-LYUN-lightgrey" alt="License">
 </p>
 
@@ -93,6 +92,8 @@ Designed for scenarios where cloud dependency, latency, or subscription cost is 
 - [x] **Async FallDetectionWorker** — daemon thread, body-to-body IoU tracking, non-blocking submit/poll
 - [x] **Three Backends** — ONNX (CPU/CUDA) / Ultralytics (PyTorch) / NCNN (ARM NEON, Raspberry Pi)
 - [x] **Backend Factory** — `create_backend("onnx"|"ncnn"|"ultralytics")` one-click switch
+- [x] **Ghost Tracking** — lost-track fall state inheritance, fallen ghosts persist 30s for re-identification
+- [x] **Cross-Camera Matching** — HSV histogram matching for dual-camera fall confirmation
 - [x] **Fall+Identity Linkage** — "Byron fell!" vs "Stranger fell!" differentiated alerts
 
 ### Behavior Analysis Layer
@@ -126,10 +127,8 @@ Designed for scenarios where cloud dependency, latency, or subscription cost is 
 - [x] **FallDetectionTask** — real implementation with YOLOv8-Pose + evaluate_fall + async worker
 - [x] **Pipeline Integration** — tasks list with per-task try/except + PerformanceMonitor timing
 
-### Engineering & Testing
+### Engineering
 
-- [x] **209/209 Comprehensive Tests** — 20 test modules, zero camera/GPU/model-download dependencies
-- [x] **Fall Detection Integration Tests** — 5 tests (imports / no-fall / disabled / worker / simulated-fall)
 - [x] **3 Deployment Profiles** — edge_minimal(320px/CPU/NCNN) / balanced(416px/CPU) / desktop(640px/CUDA/ByteTrack)
 - [x] **Layered Dependencies** — `requirements/{base,edge_cpu,desktop,jetson,dev}.txt`
 - [x] **Per-Stage Latency** — SCRFD pre/infer/post + YOLO fall timing, rolling average
@@ -371,6 +370,9 @@ project/
 │   ├── region_manager.py                # Zone system (point-in-polygon)
 │   ├── event_system.py                  # Unified event emitter
 │   ├── alert_manager.py                 # Cooldown-based alert dedup (fall-aware)
+│   ├── multi_camera_manager.py          # Multi-camera orchestration
+│   ├── camera_pipeline.py               # Per-camera processing thread
+│   ├── cross_camera.py                  # Cross-camera identity matching
 │   └── metrics_logger.py                # Unified metrics (counters/gauges)
 │
 ├── plugins/
@@ -390,10 +392,6 @@ project/
 │           ├── ultralytics_backend.py    # Ultralytics YOLO backend (PyTorch)
 │           └── postprocess.py           # Unified postprocessing (raw → Detection)
 │
-├── docs/
-│   ├── INTEGRATION_GUIDE.md             # Fusion usage guide
-│   └── specs/                           # Design + planning documents
-│
 ├── database/
 │   └── face_db.py                       # Pickle-based identity database (vectorized search)
 │
@@ -402,12 +400,6 @@ project/
 │   ├── fps.py                           # FPS counter
 │   ├── config_loader.py                 # YAML config loader
 │   └── performance_monitor.py           # Per-stage latency + recognition counters
-│
-├── tests/
-│   ├── run_all_tests.py                 # Full test runner
-│   ├── run_core_tests.py                # Core-only runner
-│   ├── test_fall_detection_integration.py  # ★ Fall detection integration tests (5)
-│   └── core/                            # 20 unit test modules (209 tests)
 │
 ├── models/
 │   ├── scrfd_500m_bnkps.onnx            # SCRFD face detection model
@@ -483,15 +475,7 @@ python -c "from ultralytics import YOLO; YOLO('models/yolov8n-pose.pt').export(f
 python register_face.py --name YourName --simple
 ```
 
-**7. Run tests (recommended)**
-
-```bash
-python tests/run_all_tests.py
-```
-
-Expected: `Overall: EDGE AI READY — 209 pass, 0 fail`
-
-**8. Run**
+**7. Run**
 
 ```bash
 python main.py
@@ -532,14 +516,6 @@ python register_face.py --list                     # List all
 python register_face.py --remove --name Alice      # Delete
 ```
 
-### Run Tests
-
-```bash
-python tests/run_all_tests.py                    # 全量 (209 checks)
-python tests/run_core_tests.py                   # 仅核心
-python tests/test_fall_detection_integration.py  # 摔倒检测集成测试 (5 tests)
-```
-
 ### Key Controls
 
 | Key | Action |
@@ -573,7 +549,7 @@ python tests/test_fall_detection_integration.py  # 摔倒检测集成测试 (5 t
 
 ### Profiles (v10)
 
-Four pre-configured profiles for different hardware tiers:
+Three pre-configured profiles for different hardware tiers:
 
 | Profile | Face Input | Fall Input | Fall Backend | Fall Interval | Tracking | GPU | Render |
 |---------|-----------|-----------|-------------|---------------|----------|-----|--------|
@@ -742,56 +718,6 @@ More Alerts             │ decrease alert cooldown, add more zones
 
 ---
 
-## Test Suite
-
-```
-$ python tests/run_all_tests.py
-
-============================================================
- SYSTEM VALIDATION REPORT
-============================================================
-  Motion Gate:            PASS (4 pass, 0 fail)
-  Tracking System:        PASS (4 pass, 0 fail)
-  Behavior Engine:        PASS (4 pass, 0 fail)
-  Region Events:          PASS (5 pass, 0 fail)
-  Performance:            PASS (5 pass, 0 fail)
-  Failure Recovery:       PASS (5 pass, 0 fail)
-  Recognition Scheduler:  PASS (17 pass, 0 fail)
-  Person Manager:         PASS (26 pass, 0 fail)
-  Track Reassociation:    PASS (13 pass, 0 fail)
-  Recognition Worker:     PASS (14 pass, 0 fail)
-  Metrics Logger:         PASS (15 pass, 0 fail)
-  Face Database:          PASS (19 pass, 0 fail)
-  Face Quality:           PASS (10 pass, 0 fail)
-  Worker Queue:           PASS (8 pass, 0 fail)
-  Embedding Cache:        PASS (6 pass, 0 fail)
-  Gallery Search:         PASS (7 pass, 0 fail)
-  VisionTask Interface:   PASS (13 pass, 0 fail)
-  FallDetection Stub:     PASS (13 pass, 0 fail)
-
-  Overall: EDGE AI READY
-  Total: 188 pass, 0 fail in 4.6s
-============================================================
-```
-
-### Fall Detection Integration Tests (v10)
-
-```
-$ python tests/test_fall_detection_integration.py
-
---- test_fall_engine_imports ---
-PASS
---- test_evaluate_fall_no_fall ---
-PASS
---- test_fall_detection_task_disabled ---
-PASS
---- test_fall_detection_task_runs ---
-PASS
---- test_evaluate_fall_detected ---
-PASS
-All tests passed!
-```
-
 ---
 
 ## Deployment Guide
@@ -892,9 +818,8 @@ requirements/
 - **新增** `plugins/fall_engine/backends/factory.py` — create_backend() 工厂 (onnx/ncnn/ultralytics)
 - **新增** `plugins/fall_engine/config.py` — 运行时配置注入 (替换原全局 config.py)
 - **新增** `models/yolov8n-pose.onnx` — YOLOv8-Pose ONNX 模型 (12.9 MB)
-- **新增** `tests/test_fall_detection_integration.py` — 摔倒检测集成测试 (5 tests, 含模拟摔倒)
-- **新增** `docs/INTEGRATION_GUIDE.md` — 融合使用指南
-- **新增** `docs/specs/` — 设计文档 + 实现计划 + 边缘优化计划
+- **新增** `docs/INTEGRATION_GUIDE.md` — 融合使用指南 (已移除)
+- **新增** `docs/specs/` — 设计文档 + 实现计划 (已移除)
 - **修改** `core/pipeline/pipeline.py` — _run_tasks() + _render() 摔倒骨架/人体框/状态
 - **修改** `core/rendering/renderer.py` — draw_skeleton() + draw_body_bbox() + draw_fall_status()
 - **修改** `core/alert_manager.py` — fall_detected / fall_potential / fall_recovered 告警分支
@@ -908,6 +833,7 @@ requirements/
 - **修复** 事件去重 (状态变化才发, 防刷屏)
 - **修复** 跨线程 _fall_tracks 访问 (person_tid 写入 last_results)
 - **修复** skeleton keypoint 边界检查 (< 0 替换 <= 0)
+- **修复** FallDetectionTask.run() 在 disabled 状态下 crash (AttributeError on None._worker)
 - **结果**: 人脸识别 + 摔倒检测融合运行, 共用 PersonManager track_id, 身份+摔倒联动告警
 
 ### v9.4 — 多摄像头架构 (2026-05-15)
@@ -931,7 +857,7 @@ requirements/
 ### v9.1 — VisionTask 插件接口 (2026-05-14)
 
 - **新增** `core/interfaces.py` — VisionTask ABC + VisionEvent
-- **新增** `plugins/fall_detection_stub.py` — 摔倒检测空实现 (已被 v10 替换)
+- **新增** `plugins/fall_detection.py` — 摔倒检测空实现 (v10 升级为真实模块)
 
 ### v9.0 — 识别性能优化 (2026-05-14)
 
@@ -994,7 +920,7 @@ Enable motion gate in config (default ON). Set `detector.input_size: 320` for fa
 <details>
 <summary><b>Fall detection not triggering when I fall?</b></summary>
 
-The system needs 3.5s sustained fall posture to confirm. Quick "fake falls" (<2s) will only trigger Potential Fall, not confirmed FALL. Ensure `runtime.enable_event_system: true` and `runtime.enable_alert: true` are set. The test `test_evaluate_fall_detected` simulates a 20-frame fall and confirms FALL detection works.
+The system needs 3.5s sustained fall posture to confirm. Quick "fake falls" (<2s) will only trigger Potential Fall, not confirmed FALL. Ensure `runtime.enable_event_system: true` and `runtime.enable_alert: true` are set.
 </details>
 
 <details>
@@ -1041,16 +967,6 @@ buffalo_l and buffalo_s embeddings are incompatible. Re-register all faces via `
 <summary><b>Camera won't open</b></summary>
 
 Try `python main.py --camera 0` for built-in, or `--camera 1` for phone. Default is 1 (DroidCam). Windows: Settings → Privacy → Camera → Allow apps.
-</details>
-
-<details>
-<summary><b>How do I run tests?</b></summary>
-
-```bash
-python tests/run_all_tests.py
-python tests/test_fall_detection_integration.py
-```
-No dependencies needed beyond Python + NumPy. Tests run in ~4 seconds.
 </details>
 
 <details>
