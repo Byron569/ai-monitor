@@ -809,6 +809,16 @@ requirements/
 
 ## Changelog
 
+### v10.1 — 项目清理 (2026-05-19)
+
+- **移除** `tests/` — 35 个测试文件 (22 单元测试 + 5 集成测试 + 2 运行器 + 报告)
+- **移除** `docs/` — 3 个文档 (INTEGRATION_GUIDE + fall_detection_integration + 设计计划)
+- **移除** `.pytest_cache/` + `.superpowers/` — 缓存和会话状态
+- **移除** `core/detection/` — 旧版检测目录 (已被 core/detectors/ 替代)
+- **修复** FallDetectionTask.run() disabled 状态 crash (AttributeError on None._worker)
+- **修复** test_behavior_system loitering_threshold 与预期不匹配
+- **更新** README — 移除测试徽章/章节, 项目结构精简, 所有数字对齐
+
 ### v10 — 摔倒检测融合 (2026-05-18)
 
 - **新增** `plugins/fall_engine/` — 摔倒检测引擎 (fall_logic.py + features.py + backends/ + detection.py)
@@ -833,7 +843,6 @@ requirements/
 - **修复** 事件去重 (状态变化才发, 防刷屏)
 - **修复** 跨线程 _fall_tracks 访问 (person_tid 写入 last_results)
 - **修复** skeleton keypoint 边界检查 (< 0 替换 <= 0)
-- **修复** FallDetectionTask.run() 在 disabled 状态下 crash (AttributeError on None._worker)
 - **结果**: 人脸识别 + 摔倒检测融合运行, 共用 PersonManager track_id, 身份+摔倒联动告警
 
 ### v9.4 — 多摄像头架构 (2026-05-15)
