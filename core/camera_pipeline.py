@@ -13,6 +13,8 @@ import time
 import cv2
 import numpy as np
 
+from core.pipeline.recognition_mixin import process_recognition_harvest
+
 logger = logging.getLogger(__name__)
 
 
@@ -236,21 +238,10 @@ class CameraPipeline(threading.Thread):
             else:
                 self._recog_skipped += 1
 
-        results = self.worker.poll_results()
-        for tid, name, sim, emb, qs in results:
-            if name != "Unknown" and emb is not None:
-                self.person_manager.identify(tid, name, emb)
-                self.recog_scheduler.mark_identified(tid, self._frame_count, name)
-                self.person_manager.cache_embedding(tid, name, emb)
-            elif emb is not None:
-                cn, _ = self.person_manager.find_cached_identity(emb)
-                if cn:
-                    self.person_manager.identify(tid, cn, emb)
-                    self.recog_scheduler.mark_identified(tid, self._frame_count, cn)
-                else:
-                    self.recog_scheduler.mark_completed(tid, self._frame_count)
-            else:
-                self.recog_scheduler.mark_completed(tid, self._frame_count)
+        process_recognition_harvest(
+            self.worker, self.person_manager, self.recog_scheduler,
+            self._frame_count,
+        )
         ids = set(self.person_manager.get_active().keys())
         self.recog_scheduler.cleanup(ids, self._frame_count)
 

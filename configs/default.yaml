@@ -97,15 +97,21 @@ tasks:
     fall:
       horizontal_ar_threshold: 0.6
       angle_threshold: 120
-      torso_inclination_threshold: 65
+      torso_inclination_threshold: 55
       min_fall_pose_duration: 3.5
-      re_threshold: 20
+      re_threshold: 8
       gf_threshold: 8000
       head_descent_threshold: 0.2
-      window_size: 10
+      fast_re_threshold: 15
+      fast_gf_threshold: 15000
+      fast_angle_threshold: 120
+      rebound_threshold: 0.15
+      rebound_frames: 2
+      recovery_frames: 3
+      window_size: 20
       window_trigger_ratio: 0.5
-      min_consecutive_triggers: 3
-      min_standing_ar: 1.2
+      min_consecutive_triggers: 5
+      min_standing_ar: 1.0
       min_bbox_area: 3000
       ema_alpha: 0.3
       sg_window: 7
@@ -114,12 +120,23 @@ tasks:
       head_descent_window: 20
       head_descent_min_pixels: 15
     tracking:
-      ghost_timeout: 3.0
-      fallen_ghost_timeout: 5.0
-      distance_threshold: 150
-      history_length: 36
+      ghost_timeout: 3.0              # 普通目标幽灵超时（秒）
+      ghost_timeout_fallen: 30.0       # 已跌倒目标幽灵超时（秒）
+      ghost_distance_multiplier: 1.5   # 幽灵匹配距离倍数
+      distance_threshold: 150          # 质心匹配最大像素距离
+      cleanup_interval: 5              # 清理间隔（秒）
+      history_length: 36               # 关键点历史缓冲
     cross_camera:
       hist_threshold: 0.5
     camera_process:
       roi_conf: 0.25
       roi_enabled: true
+
+cross_camera:
+  mode: single                    # single / dual / multi
+  hist_threshold: 0.5             # HSV 直方图匹配阈值
+  hist_mismatch_threshold: 0.2    # 错误匹配拆分阈值
+  hist_nbins: 8                   # HSV 直方图 bin 数
+  dual_cam_confirm: true          # 启用双摄确认
+  single_cam_fall_confidence: 0.6
+  dual_cam_fall_confidence: 0.95

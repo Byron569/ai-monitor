@@ -9,7 +9,7 @@ Pipeline v9 — 边缘最小化管线。
 
 import logging
 import time
-from typing import Dict
+from typing import Dict, Optional
 
 import cv2
 import numpy as np
@@ -22,7 +22,9 @@ from core.track_memory import TrackMemory
 from core.person import PersonManager
 from core.scheduler import RecognitionScheduler
 from core.workers import RecognitionWorker
+from core.pipeline.recognition_mixin import process_recognition_harvest
 from utils import FPS, PerformanceMonitor
+from utils.geometry import compute_iou
 from utils.motion_gate import MotionGate
 
 logger = logging.getLogger(__name__)
@@ -50,26 +52,26 @@ class Pipeline:
         detector: SCRFDDetector,
         renderer: Renderer,
         fps: FPS,
-        tracker,  # Any: MultiObjectTracker | LightweightIoUTracker
+        tracker: Optional[object],
         person_manager: PersonManager,
         recog_scheduler: RecognitionScheduler,
         worker: RecognitionWorker,
         monitor: PerformanceMonitor,
         motion_gate: MotionGate,
         frame_scheduler: FrameScheduler,
-        track_reassociation = None,
-        quality_filter = None,
-        trajectory_analyzer = None,
-        behavior_engine = None,
-        region_manager = None,
-        event_system = None,
-        alert_manager = None,
+        track_reassociation: Optional[object] = None,
+        quality_filter: Optional[object] = None,
+        trajectory_analyzer: Optional[object] = None,
+        behavior_engine: Optional[object] = None,
+        region_manager: Optional[object] = None,
+        event_system: Optional[object] = None,
+        alert_manager: Optional[object] = None,
         window_name: str = "Vision AI",
         quit_key: str = "q",
         no_render: bool = False,
         max_frames: int = 0,
         queue_pressure_threshold: int = 3,
-        tasks: list = None,
+        tasks: Optional[list] = None,
     ):
         self.camera = camera
         self.detector = detector
@@ -127,179 +129,181 @@ class Pipeline:
 
         with self.camera as cam:
             while self._running:
-                # === 1. Camera ===
                 self.monitor.tick("camera")
                 ret, frame = cam.read()
                 if not ret:
                     continue
                 self.monitor.tock("camera", "camera")
 
-                # === 2. Motion Gate ===
-                motion_active, motion_score = self.motion_gate.check(frame)
-
-                # === 3. Scheduler 决定是否需要 SCRFD 纠错 ===
-                sched_allow, sched_reason = self.frame_scheduler.should_detect(
-                    self._frame_count, motion_active, motion_score
-                )
-
-                # 额外规则：有 lost track → 必须运行 SCRFD
-                lost_count = self._track_memory.lost_count
-                need_correction = sched_allow or lost_count > 0
-
-                self.monitor.tick("detect")
-                detections = []
-                correction_reason = sched_reason
-                if need_correction:
-                    detections = self.detector.detect(frame)
-                    if lost_count > 0 and not sched_allow:
-                        correction_reason = f"recovery ({lost_count} lost tracks)"
-                self.monitor.tock("detect", "detect")
-
-                # === 4. Tracker + TrackMemory (TrackMemory作为ID权威) ===
-                self.monitor.tick("track")
-                track_dets = [(d[0], d[1], d[2], d[3], d[4]) for d in detections]
-                if track_dets:
-                    self.tracker.update(track_dets, frame)
-                
-                # TrackMemory 贪心匹配（按x排序防止交叉运动抢ID）
-                active_tracks = {}
-                if detections:
-                    det_bboxes = [(d[0], d[1], d[2], d[3]) for d in detections]
-                    matches = self._track_memory.match_hungarian(det_bboxes)
-                    for det_idx, tid in matches.items():
-                        active_tracks[tid] = det_bboxes[det_idx]
-                    for i, bbox in enumerate(det_bboxes):
-                        if i not in matches:
-                            tid = self._next_tid
-                            self._next_tid += 1
-                            active_tracks[tid] = bbox
-                else:
-                    active_tracks = {}  # 无检测时不注入缓存，让 PersonManager 自然老化
-                self._track_memory.update(active_tracks)
-
-                # 解锁丢失 track 的匹配锁
-                for tid in list(self._track_memory._tracks.keys()):
-                    ts = self._track_memory._tracks[tid]
-                    if ts.status == "lost":
-                        self._track_memory.clear_lock(tid)
-                self.monitor.tock("track", "track")
-
-                # === 6. PersonManager 同步 ===
-                for tid, (x1, y1, x2, y2) in active_tracks.items():
-                    self.person_manager.get_or_create(tid, (x1, y1, x2, y2))
-                if detections:
-                    self._update_landmarks_cache(detections, active_tracks)
-                self.person_manager.cleanup()
-
-                # === 7a. Identity Triggers (always active) ===
-                # Trigger 1: box out of frame → force re-recognize
-                h, w = frame.shape[:2]
-                for tid, person in self.person_manager.get_active().items():
-                    x1, y1, x2, y2 = person.bbox
-                    out_left = x2 <= 0
-                    out_right = x1 >= w
-                    out_top = y2 <= 0
-                    out_bottom = y1 >= h
-                    if out_left or out_right or out_top or out_bottom:
-                        self.recog_scheduler.force_recognize(tid)
-                        self.person_manager.reset_identity(tid)
-                        logger.info(f"[TRIGGER] track={tid} left frame, force recognize")
-
-                # Trigger 2: overlap → reset identity; separation 0.5s → unlock + re-recognize
-                active_list = list(self.person_manager.get_active().items())
-                for i in range(len(active_list)):
-                    for j in range(i + 1, len(active_list)):
-                        tid_a, pa = active_list[i]
-                        tid_b, pb = active_list[j]
-                        overlap = self._calc_iou(pa.bbox, pb.bbox)
-                        key = (min(tid_a, tid_b), max(tid_a, tid_b))
-                        if overlap > 0.3:
-                            if key not in self._overlap_start:
-                                self._overlap_start[key] = self._frame_count
-                                self.person_manager.reset_identity(tid_a)
-                                self.person_manager.reset_identity(tid_b)
-                                logger.info(f"[TRIGGER] tracks {tid_a},{tid_b} overlapping, reset identity")
-                            self._separation_time.pop(key, None)
-                        else:
-                            prev = self._overlap_start.pop(key, None)
-                            if prev is not None and prev > 0:
-                                if key not in self._separation_time:
-                                    self._separation_time[key] = self._frame_count
-                                elif self._frame_count - self._separation_time[key] > 15:
-                                    self.recog_scheduler.force_recognize(tid_a)
-                                    self.recog_scheduler.force_recognize(tid_b)
-                                    self._track_memory.clear_lock(tid_a)
-                                    self._track_memory.clear_lock(tid_b)
-                                    self._separation_time.pop(key, None)
-                                    logger.info(f"[TRIGGER] tracks {tid_a},{tid_b} separated 0.5s, unlock+recognize")
-
-                # === 7b. Behavior Analysis (全部由初始化开关控制) ===
-                if self._behavior_enabled:
-                    if self.trajectory_analyzer:
-                        for tid, (x1, y1, x2, y2) in active_tracks.items():
-                            self.trajectory_analyzer.analyze(tid, (x1, y1, x2, y2))
-                        active_ids = set(self.person_manager.get_active().keys())
-                        self.trajectory_analyzer.cleanup(active_ids)
-
-                    if self.behavior_engine:
-                        for tid in list(self.person_manager.get_active().keys()):
-                            self.behavior_engine.update(tid, self._frame_count)
-                        active_ids = set(self.person_manager.get_active().keys())
-                        self.behavior_engine.cleanup(active_ids)
-
-                    if self.region_manager and self.behavior_engine:
-                        for tid, person in self.person_manager.get_active().items():
-                            bs = self.behavior_engine.get(tid)
-                            if bs is None:
-                                continue
-                            entered, ztype, zname = self.region_manager.check_entry(
-                                tid, person.bbox
-                            )
-                            if entered and ztype == "restricted" and self.event_system:
-                                self.event_system.emit(
-                                    "restricted_entered", tid,
-                                    zone=zname, behavior=bs.behavior.value,
-                                )
-                            if bs.behavior.value == "loitering" and self.event_system:
-                                self.event_system.emit(
-                                    "loitering_detected", tid,
-                                    confidence=bs.confidence,
-                                )
-
-                    if self.event_system:
-                        events = self.event_system.flush()
-                        if events and self.alert_manager:
-                            self.alert_manager.process(events)
-
-                # === 7. Recognition (事件触发：仅新 track / not identified) ===
-                self.monitor.tick("recognize")
+                detections, motion_active, motion_score, reason = self._run_detection(frame)
+                active_tracks = self._run_tracking(detections)
+                self._sync_person_manager(active_tracks, detections)
+                self._run_identity_triggers(frame, active_tracks)
+                self._run_behavior_analysis(active_tracks)
                 self._process_recognition(frame)
-                self.monitor.tock("recognize", "recognize")
-
-                # === 7.5. VisionTask Plugins (可插拔扩展任务) ===
                 self._run_tasks(frame, active_tracks)
 
-                # === 8. Render (skipped if no_render) ===
                 if not self.no_render:
-                    self.monitor.tick("render")
-                    self._render(frame, motion_active, motion_score, correction_reason)
-                    self.monitor.tock("render", "render")
-
+                    self._render(frame, motion_active, motion_score, reason)
                     cv2.imshow(self.window_name, frame)
 
-                # quit check (always active, even in no_render)
                 key = cv2.waitKey(1) & 0xFF
                 if key == ord(self.quit_key) or key == ord(self.quit_key.upper()):
                     self._running = False
 
                 self._frame_count += 1
 
-                # max_frames limit for benchmark mode
                 if self.max_frames > 0 and self._frame_count >= self.max_frames:
                     self._running = False
 
         self.worker.stop()
         print(f"[Pipeline] 已退出 (共 {self._frame_count} 帧)")
+
+    # ------------------------------------------------------------------
+    # Detection
+    # ------------------------------------------------------------------
+
+    def _run_detection(self, frame):
+        self.monitor.tick("detect")
+        lost_count = self._track_memory.lost_count
+        motion_active, motion_score = self.motion_gate.check(frame)
+        sched_allow, sched_reason = self.frame_scheduler.should_detect(
+            self._frame_count, motion_active, motion_score
+        )
+        need_correction = sched_allow or lost_count > 0
+        detections = []
+        correction_reason = sched_reason
+        if need_correction:
+            detections = self.detector.detect(frame)
+            if lost_count > 0 and not sched_allow:
+                correction_reason = f"recovery ({lost_count} lost tracks)"
+        self.monitor.tock("detect", "detect")
+        return detections, motion_active, motion_score, correction_reason
+
+    # ------------------------------------------------------------------
+    # Tracking
+    # ------------------------------------------------------------------
+
+    def _run_tracking(self, detections):
+        self.monitor.tick("track")
+        track_dets = [(d[0], d[1], d[2], d[3], d[4]) for d in detections]
+        if track_dets:
+            self.tracker.update(track_dets, frame=None)
+        active_tracks = {}
+        if detections:
+            det_bboxes = [(d[0], d[1], d[2], d[3]) for d in detections]
+            matches = self._track_memory.match_hungarian(det_bboxes)
+            for det_idx, tid in matches.items():
+                active_tracks[tid] = det_bboxes[det_idx]
+            for i, bbox in enumerate(det_bboxes):
+                if i not in matches:
+                    tid = self._next_tid; self._next_tid += 1
+                    active_tracks[tid] = bbox
+        self._track_memory.update(active_tracks)
+        for tid in list(self._track_memory._tracks.keys()):
+            ts = self._track_memory._tracks[tid]
+            if ts.status == "lost":
+                self._track_memory.clear_lock(tid)
+        self.monitor.tock("track", "track")
+        return active_tracks
+
+    # ------------------------------------------------------------------
+    # PersonManager sync
+    # ------------------------------------------------------------------
+
+    def _sync_person_manager(self, active_tracks, detections):
+        for tid, (x1, y1, x2, y2) in active_tracks.items():
+            self.person_manager.get_or_create(tid, (x1, y1, x2, y2))
+        if detections:
+            self._update_landmarks_cache(detections, active_tracks)
+        self.person_manager.cleanup()
+
+    # ------------------------------------------------------------------
+    # Identity Triggers
+    # ------------------------------------------------------------------
+
+    def _run_identity_triggers(self, frame, active_tracks):
+        h, w = frame.shape[:2]
+        for tid, person in self.person_manager.get_active().items():
+            x1, y1, x2, y2 = person.bbox
+            out_left = x2 <= 0
+            out_right = x1 >= w
+            out_top = y2 <= 0
+            out_bottom = y1 >= h
+            if out_left or out_right or out_top or out_bottom:
+                self.recog_scheduler.force_recognize(tid)
+                self.person_manager.reset_identity(tid)
+                logger.info(f"[TRIGGER] track={tid} left frame, force recognize")
+
+        active_list = list(self.person_manager.get_active().items())
+        for i in range(len(active_list)):
+            for j in range(i + 1, len(active_list)):
+                tid_a, pa = active_list[i]
+                tid_b, pb = active_list[j]
+                overlap = compute_iou(pa.bbox, pb.bbox)
+                key = (min(tid_a, tid_b), max(tid_a, tid_b))
+                if overlap > 0.3:
+                    if key not in self._overlap_start:
+                        self._overlap_start[key] = self._frame_count
+                        self.person_manager.reset_identity(tid_a)
+                        self.person_manager.reset_identity(tid_b)
+                        logger.info(f"[TRIGGER] tracks {tid_a},{tid_b} overlapping, reset identity")
+                    self._separation_time.pop(key, None)
+                else:
+                    prev = self._overlap_start.pop(key, None)
+                    if prev is not None and prev > 0:
+                        if key not in self._separation_time:
+                            self._separation_time[key] = self._frame_count
+                        elif self._frame_count - self._separation_time[key] > 15:
+                            self.recog_scheduler.force_recognize(tid_a)
+                            self.recog_scheduler.force_recognize(tid_b)
+                            self._track_memory.clear_lock(tid_a)
+                            self._track_memory.clear_lock(tid_b)
+                            self._separation_time.pop(key, None)
+                            logger.info(f"[TRIGGER] tracks {tid_a},{tid_b} separated 0.5s, unlock+recognize")
+
+    # ------------------------------------------------------------------
+    # Behavior Analysis
+    # ------------------------------------------------------------------
+
+    def _run_behavior_analysis(self, active_tracks):
+        if not self._behavior_enabled:
+            return
+        if self.trajectory_analyzer:
+            for tid, (x1, y1, x2, y2) in active_tracks.items():
+                self.trajectory_analyzer.analyze(tid, (x1, y1, x2, y2))
+            active_ids = set(self.person_manager.get_active().keys())
+            self.trajectory_analyzer.cleanup(active_ids)
+
+        if self.behavior_engine:
+            for tid in list(self.person_manager.get_active().keys()):
+                self.behavior_engine.update(tid, self._frame_count)
+            active_ids = set(self.person_manager.get_active().keys())
+            self.behavior_engine.cleanup(active_ids)
+
+        if self.region_manager and self.behavior_engine:
+            for tid, person in self.person_manager.get_active().items():
+                bs = self.behavior_engine.get(tid)
+                if bs is None:
+                    continue
+                entered, ztype, zname = self.region_manager.check_entry(
+                    tid, person.bbox
+                )
+                if entered and ztype == "restricted" and self.event_system:
+                    self.event_system.emit(
+                        "restricted_entered", tid,
+                        zone=zname, behavior=bs.behavior.value,
+                    )
+                if bs.behavior.value == "loitering" and self.event_system:
+                    self.event_system.emit(
+                        "loitering_detected", tid,
+                        confidence=bs.confidence,
+                    )
+
+        if self.event_system:
+            events = self.event_system.flush()
+            if events and self.alert_manager:
+                self.alert_manager.process(events)
 
     # ------------------------------------------------------------------
     # Landmarks cache
@@ -310,22 +314,12 @@ class Pipeline:
             best_iou, best_kps = 0, None
             for d in detections:
                 dx1, dy1, dx2, dy2 = d[0], d[1], d[2], d[3]
-                iou_val = self._calc_iou((tx1, ty1, tx2, ty2), (dx1, dy1, dx2, dy2))
+                iou_val = compute_iou((tx1, ty1, tx2, ty2), (dx1, dy1, dx2, dy2))
                 if iou_val > best_iou:
                     best_iou = iou_val
                     best_kps = d[5]
             if best_kps is not None and best_iou > 0.3:
                 self._landmarks_cache[tid] = np.array(best_kps)
-
-    @staticmethod
-    def _calc_iou(a, b):
-        x1 = max(a[0], b[0]); y1 = max(a[1], b[1])
-        x2 = min(a[2], b[2]); y2 = min(a[3], b[3])
-        inter = max(0, x2 - x1) * max(0, y2 - y1)
-        area_a = (a[2] - a[0]) * (a[3] - a[1])
-        area_b = (b[2] - b[0]) * (b[3] - b[1])
-        union = area_a + area_b - inter
-        return inter / union if union > 0 else 0
 
     def _find_or_create_tid(self, bbox: tuple, exclude: set = None) -> int:
         tid = self._track_memory.find_nearest(bbox, max_dist=150, exclude=exclude)
@@ -394,22 +388,10 @@ class Pipeline:
                 self.monitor.inc("recog_skip")
 
         # Harvest results
-        results = self.worker.poll_results()
-        for tid, name, sim, emb, qs in results:
-            if name != "Unknown" and emb is not None:
-                self.person_manager.identify(tid, name, emb)
-                self.recog_scheduler.mark_identified(tid, self._frame_count, name)
-                self.person_manager.cache_embedding(tid, name, emb)
-            elif emb is not None:
-                cached_name, _ = self.person_manager.find_cached_identity(emb)
-                if cached_name is not None:
-                    self.person_manager.identify(tid, cached_name, emb)
-                    self.recog_scheduler.mark_identified(tid, self._frame_count, cached_name)
-                    self.person_manager.cache_embedding(tid, cached_name, emb)
-                else:
-                    self.recog_scheduler.mark_completed(tid, self._frame_count)
-            else:
-                self.recog_scheduler.mark_completed(tid, self._frame_count)
+        process_recognition_harvest(
+            self.worker, self.person_manager, self.recog_scheduler,
+            self._frame_count,
+        )
 
         # Hard dedup: one registered name max
         seen: Dict[str, int] = {}
@@ -456,13 +438,15 @@ class Pipeline:
             try:
                 if not task.should_run(self._frame_count, tracks, ctx):
                     continue
-            except Exception:
+            except (ValueError, TypeError, RuntimeError) as e:
+                logger.warning(f"[Pipeline] task {task.name} should_run error: {e}")
                 continue
 
             self.monitor.tick(f"task.{task.name}")
             try:
                 events = task.run(frame, tracks, ctx)
-            except Exception:
+            except (ValueError, TypeError, RuntimeError) as e:
+                logger.warning(f"[Pipeline] task {task.name} run error: {e}")
                 events = []
             self.monitor.tock(f"task.{task.name}", f"task.{task.name}")
 

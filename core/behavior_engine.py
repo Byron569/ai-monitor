@@ -72,13 +72,13 @@ class BehaviorEngine:
 
         bs = self._states[track_id]
 
-        # 规则判断
-        if tf.stationary_frames >= self.stationary_threshold:
-            new_behavior = Behavior.STATIONARY
-            confidence = min(1.0, tf.stationary_frames / self.loitering_threshold)
-        elif tf.stationary_frames >= self.loitering_threshold:
+        # 规则判断（优先检查更高阈值，防止 LOITERING 被 STATIONARY 屏蔽）
+        if tf.stationary_frames >= self.loitering_threshold:
             new_behavior = Behavior.LOITERING
             confidence = min(1.0, (tf.stationary_frames - self.loitering_threshold) / 100)
+        elif tf.stationary_frames >= self.stationary_threshold:
+            new_behavior = Behavior.STATIONARY
+            confidence = min(1.0, tf.stationary_frames / self.loitering_threshold)
         else:
             new_behavior = Behavior.MOVING
             confidence = tf.movement_score

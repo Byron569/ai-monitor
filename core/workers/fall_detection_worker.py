@@ -14,6 +14,10 @@ from queue import Queue, Full, Empty
 
 import numpy as np
 
+from utils.geometry import compute_iou
+from plugins.fall_engine.features import yolo_to_5keypoints, get_torso_inclination
+from plugins.fall_engine.fall_logic import evaluate_fall
+
 logger = logging.getLogger(__name__)
 
 
@@ -32,6 +36,8 @@ class FallDetectionWorker(threading.Thread):
         max_queue_size: int = 2,
         interval: int = 15,
         confidence_threshold: float = 0.5,
+        ghost_timeout: float = 3.0,
+        ghost_timeout_fallen: float = 30.0,
     ):
         super().__init__(daemon=True)
         self._backend = inference_backend
@@ -46,6 +52,10 @@ class FallDetectionWorker(threading.Thread):
         self._fall_tracks: dict = {}
         self._next_fall_tid: int = 1000
         self._track_max_lost: int = 30
+
+        # Ghost 目标机制：丢失 track 不立即删除，而是标记为 ghost 保留 fall_state
+        self._ghost_timeout = ghost_timeout
+        self._ghost_timeout_fallen = ghost_timeout_fallen
 
         # 最新结果缓存 (主线程直接读)
         self.last_results: dict = {}
@@ -102,40 +112,36 @@ class FallDetectionWorker(threading.Thread):
         if frame_id % self._interval != 0:
             return
 
+        # 心跳
+        if frame_id % 30 == 0:
+            logger.info(f"[FallWorker] frame=#{frame_id} "
+                        f"tracks={len(self._fall_tracks)}")
+
         # 1. 推理
         detections = self._backend.infer(frame)
-        if not detections:
-            return
 
         # 2. 构建检测列表
         det_list = []
-        for det in detections:
-            kp_list = det.keypoints
-            if len(kp_list) < 17:
-                continue
-            kp_array = np.array([[kp.x, kp.y] for kp in kp_list], dtype=np.float32)
-            confs = np.array([kp.confidence for kp in kp_list], dtype=np.float32)
-            det_list.append({"bbox": det.bbox, "keypoints": kp_array.tolist(), "confs": confs})
+        if detections:
+            for det in detections:
+                kp_list = det.keypoints
+                if len(kp_list) < 17:
+                    continue
+                kp_array = np.array([[kp.x, kp.y] for kp in kp_list], dtype=np.float32)
+                confs = np.array([kp.confidence for kp in kp_list], dtype=np.float32)
+                det_list.append({"bbox": det.bbox, "keypoints": kp_array.tolist(), "confs": confs})
 
-        if not det_list:
-            return
-
-        # 心跳
-        if frame_id % 30 == 0:
-            logger.info(f"[FallWorker] frame=#{frame_id} detected={len(det_list)} "
-                        f"tracks={len(self._fall_tracks)}")
-
-        # 3. body-to-body IoU 匹配
+        # 3. IoU 匹配 (含 ghost 继承)
         matched_ftids = set()
         unmatched_dets = list(range(len(det_list)))
 
-        if self._fall_tracks:
+        if det_list and self._fall_tracks:
             ftids = list(self._fall_tracks.keys())
             iou_matrix = np.zeros((len(ftids), len(det_list)))
             for i, ftid in enumerate(ftids):
                 tb = self._fall_tracks[ftid]["bbox"]
                 for j, d in enumerate(det_list):
-                    iou_matrix[i, j] = self._iou(tb, d["bbox"])
+                    iou_matrix[i, j] = compute_iou(tb, d["bbox"])
 
             while True:
                 best = None
@@ -153,39 +159,59 @@ class FallDetectionWorker(threading.Thread):
                 self._fall_tracks[ftid]["keypoints"] = det["keypoints"]
                 self._fall_tracks[ftid]["confs"] = det["confs"]
                 self._fall_tracks[ftid]["last_seen"] = frame_id
+                self._fall_tracks[ftid]["is_ghost"] = False
                 matched_ftids.add(ftid)
                 ftids.pop(i)
                 unmatched_dets.remove(j)
 
-        # 新 track (上限 10 人, 防止虚假检测膨胀)
+        # 4. Ghost 继承：新检测尝试从附近 ghost 继承 fall_state (ROI 替代方案)
         for j in unmatched_dets:
             if len(self._fall_tracks) >= 10:
                 break
             det = det_list[j]
             ftid = self._next_fall_tid
             self._next_fall_tid += 1
+            inherited_fs = self._find_ghost_fall_state(det["bbox"])
+            fall_state = inherited_fs if inherited_fs is not None else self._new_fall_state()
             self._fall_tracks[ftid] = {
                 "bbox": det["bbox"],
                 "keypoints": det["keypoints"],
                 "confs": det["confs"],
                 "history": [],
-                "fall_state": self._new_fall_state(),
+                "fall_state": fall_state,
                 "last_seen": frame_id,
                 "person_tid": None,
+                "is_ghost": False,
             }
 
-        # 清理丢失 track
-        stale = [ftid for ftid, t in self._fall_tracks.items()
-                 if frame_id - t["last_seen"] > self._track_max_lost]
-        for ftid in stale:
-            del self._fall_tracks[ftid]
+        # 5. 将未匹配的现有 track 标记为 ghost
+        for ftid, ft in self._fall_tracks.items():
+            if ftid not in matched_ftids:
+                fs = ft.get("fall_state", {})
+                if fs.get("is_potential_fall") or fs.get("fall_detected"):
+                    ft["is_ghost"] = True
+                    if "ghost_start_time" not in ft:
+                        ft["ghost_start_time"] = time.time()
 
-        # 4. 每个 track 运行 evaluate_fall
-        from plugins.fall_engine.features import yolo_to_5keypoints, get_torso_inclination
-        from plugins.fall_engine.fall_logic import evaluate_fall
+        # 6. 清理过期 ghost
+        self._cleanup_ghosts()
 
+        # 7. 每个非 ghost track 运行 evaluate_fall
+        self._evaluate_all_tracks(frame_id, person_tracks)
+
+        # 通知主线程有新结果
+        try:
+            self._output_queue.put_nowait(True)
+        except Full:
+            pass
+
+    def _evaluate_all_tracks(self, frame_id, person_tracks):
+        """对所有非 ghost track 进行跌倒评估。"""
         new_results = {}
         for ftid, ft in self._fall_tracks.items():
+            if ft.get("is_ghost", False):
+                continue
+
             kp_array = np.array(ft["keypoints"], dtype=np.float32)
             confs = np.array(ft.get("confs", [0.5] * 17), dtype=np.float32)
 
@@ -193,7 +219,6 @@ class FallDetectionWorker(threading.Thread):
             if kp_5 is None:
                 continue
 
-            # 追加 history
             ft["history"].append(kp_5)
             if len(ft["history"]) > 20:
                 ft["history"] = ft["history"][-20:]
@@ -247,11 +272,48 @@ class FallDetectionWorker(threading.Thread):
 
         self.last_results = new_results
 
-        # 通知主线程有新结果
-        try:
-            self._output_queue.put_nowait(True)
-        except Full:
-            pass
+    # ------------------------------------------------------------------
+    # Ghost 目标机制 (ROI 替代方案: 零额外推理)
+    # ------------------------------------------------------------------
+
+    def _find_ghost_fall_state(self, new_bbox):
+        """从附近 ghost 继承 fall_state。成功继承后删除原 ghost。"""
+        for ftid, ft in list(self._fall_tracks.items()):
+            if not ft.get("is_ghost", False):
+                continue
+            fs = ft.get("fall_state", {})
+            if not fs.get("is_potential_fall") and not fs.get("fall_detected"):
+                continue
+            if compute_iou(new_bbox, ft["bbox"]) > 0.2:
+                inherited = dict(fs)
+                del self._fall_tracks[ftid]
+                return inherited
+        return None
+
+    def _cleanup_ghosts(self):
+        """清理过期的 ghost track。"""
+        now = time.time()
+        stale = []
+        for ftid, ft in self._fall_tracks.items():
+            if not ft.get("is_ghost", False):
+                continue
+            gs = ft.get("ghost_start_time", now)
+            timeout = self._ghost_timeout_fallen if ft["fall_state"].get(
+                "fall_detected") else self._ghost_timeout
+            if now - gs > timeout:
+                stale.append(ftid)
+        for ftid in stale:
+            del self._fall_tracks[ftid]
+
+    def _process_ghosts_for_test(self, frame_id, person_tracks):
+        """测试辅助：当无检测时，将有跌倒嫌疑的 track 转为 ghost。"""
+        for ft in self._fall_tracks.values():
+            fs = ft.get("fall_state", {})
+            if fs.get("is_potential_fall") or fs.get("fall_detected"):
+                ft["is_ghost"] = True
+                if "ghost_start_time" not in ft:
+                    ft["ghost_start_time"] = time.time()
+        self._cleanup_ghosts()
 
     # ==================================================================
     # 辅助方法
@@ -264,15 +326,6 @@ class FallDetectionWorker(threading.Thread):
             "fall_detected": False, "trigger_history": [],
             "consecutive_triggers": 0, "trigger_gap_count": 0,
         }
-
-    @staticmethod
-    def _iou(boxA, boxB):
-        xA, yA = max(boxA[0], boxB[0]), max(boxA[1], boxB[1])
-        xB, yB = min(boxA[2], boxB[2]), min(boxA[3], boxB[3])
-        interArea = max(0, xB - xA) * max(0, yB - yA)
-        boxAArea = (boxA[2] - boxA[0]) * (boxA[3] - boxA[1])
-        boxBArea = (boxB[2] - boxB[0]) * (boxB[3] - boxB[1])
-        return interArea / float(boxAArea + boxBArea - interArea + 1e-8)
 
     @staticmethod
     def _match_person(body_bbox, person_tracks):

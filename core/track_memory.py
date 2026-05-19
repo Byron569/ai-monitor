@@ -142,7 +142,8 @@ class TrackMemory:
 
     def clear_lock(self, track_id: int) -> None:
         self._locked_matches.pop(track_id, None)
-        """返回并清空本帧新注册的 track ID。"""
+
+    def flush_new_registrations(self) -> set:
         regs = self._new_registrations.copy()
         self._new_registrations.clear()
         return regs

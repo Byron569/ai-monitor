@@ -18,31 +18,10 @@ TrackReassociation — 轨迹重关联引擎。
 import logging
 from typing import Dict, List, Optional, Tuple
 
+from utils.geometry import compute_iou, compute_center, compute_distance
 from core.track_memory import TrackMemory, TrackState
 
 logger = logging.getLogger(__name__)
-
-
-def _iou(a: Tuple[int, int, int, int], b: Tuple[int, int, int, int]) -> float:
-    x1 = max(a[0], b[0])
-    y1 = max(a[1], b[1])
-    x2 = min(a[2], b[2])
-    y2 = min(a[3], b[3])
-    inter = max(0, x2 - x1) * max(0, y2 - y1)
-    area_a = (a[2] - a[0]) * (a[3] - a[1])
-    area_b = (b[2] - b[0]) * (b[3] - b[1])
-    union = area_a + area_b - inter
-    return inter / union if union > 0 else 0
-
-
-def _center(bbox: Tuple[int, int, int, int]) -> Tuple[float, float]:
-    return ((bbox[0] + bbox[2]) / 2, (bbox[1] + bbox[3]) / 2)
-
-
-def _distance(a: Tuple[int, int, int, int], b: Tuple[int, int, int, int]) -> float:
-    ca = _center(a)
-    cb = _center(b)
-    return ((ca[0] - cb[0]) ** 2 + (ca[1] - cb[1]) ** 2) ** 0.5
 
 
 class TrackReassociation:
@@ -99,7 +78,7 @@ class TrackReassociation:
             for tid, ts in lost_tracks.items():
                 if tid in used_tids:
                     continue
-                iou_val = _iou(bbox_det, ts.bbox)
+                iou_val = compute_iou(bbox_det, ts.bbox)
                 if iou_val > best_iou:
                     best_iou = iou_val
                     best_tid = tid
@@ -117,7 +96,7 @@ class TrackReassociation:
             for tid, ts in lost_tracks.items():
                 if tid in used_tids:
                     continue
-                dist = _distance(bbox_det, ts.bbox)
+                dist = compute_distance(bbox_det, ts.bbox)
                 if dist < best_dist:
                     best_dist = dist
                     best_tid = tid
