@@ -13,17 +13,20 @@ camera:
   api: null
 
 detector:
-  type: scrfd
-  model_name: "buffalo_s"
+  type: scrfd_onnx
+  model_path: "models/scrfd_500m.onnx"
   input_size: 640
   conf_threshold: 0.5
   nms_threshold: 0.4
   detection_interval: 2
   device: cuda
+  box_padding: 0.25
+  box_shift_y: -0.25
+  box_shift_x: -0.05
 
 recognition:
-  model_name: "buffalo_s"
-  recognition_threshold: 0.70
+  model_path: "models/w600k_mbf.onnx"
+  recognition_threshold: 0.45
   recognition_cooldown: 180
   recognized_cooldown: 600
   failed_backoff: 90
@@ -59,8 +62,8 @@ runtime:
   mode: desktop
   use_gpu: true
   enable_behavior: false
-  enable_event_system: false
-  enable_alert: false
+  enable_event_system: true
+  enable_alert: true
   enable_reassociation: false
   enable_region: false
 
@@ -98,9 +101,40 @@ tensorrt:
 
 tasks:
   fall_detection:
+    enabled: true
+    backend: onnx
+    model_path: "models/yolov8n-pose.onnx"
+    device: cuda
+    interval: 3
+    input_size: 640
+    confidence_threshold: 0.35
+    fall:
+      horizontal_ar_threshold: 0.6
+      angle_threshold: 120
+      torso_inclination_threshold: 65
+      min_fall_pose_duration: 2.0
+      window_size: 10
+      window_trigger_ratio: 0.5
+      min_consecutive_triggers: 3
+    features:
+      head_descent_window: 20
+    tracking:
+      ghost_timeout: 1.0
+      fallen_ghost_timeout: 5.0
+
+notification:
+  enabled: true
+  port: 8080
+  update_interval: 30
+  webhooks:
     enabled: false
-    interval: 5
-    model: null
-    device: cpu
-    confidence_threshold: 0.6
-    min_duration_frames: 10
+    wecom_url: null
+    dingtalk_url: null
+    rate_limit: 60
+  email:
+    enabled: true
+    smtp_host: "smtp.qq.com"
+    smtp_port: 465
+    username: "3049169447@qq.com"
+    password: "gypvegbaxyztdgae"
+    receiver: "3049169447@qq.com"

@@ -1,0 +1,157 @@
+# Vision AI — Raspberry Pi 5 Production Profile
+#
+# Usage:
+#   python main.py --profile pi5_production
+#   python main.py --config configs/pi5_production.yaml
+#
+# Hardware: Raspberry Pi 5 (4× Cortex-A76 @ 2.4 GHz, 8 GB RAM)
+# Backend:  ONNX Runtime CPU (preferred) or NCNN ARM NEON (experimental)
+#
+# Engineering decisions:
+#   - 320px detection (best speed/accuracy trade-off for ARM)
+#   - CPU-only (no GPU on standard Pi 5)
+#   - SCRFD ONNX backend by default (mature, well-tested)
+#   - NCNN backend for fall detection (YOLOv8n-pose benefits from ARM NEON)
+#   - Motion-based adaptive scheduling to save CPU
+#   - Memory pressure monitoring with degrade modes
+#   - IoU tracking (lightweight, no ByteTrack dependency)
+#   - No behavior analysis (saves ~30% CPU)
+#   - No region-based rules
+
+profile: pi5_production
+
+camera:
+  index: 0
+  width: 640
+  height: 480
+  api: null
+
+detector:
+  type: scrfd_onnx             # scrfd_onnx (mature) or scrfd_ncnn (experimental ARM NEON)
+  model_path: "models/scrfd_500m_int8.onnx"
+  backend: onnx                 # onnx / ncnn
+  input_size: 320               # 320px for edge speed
+  device: cpu
+  detection_interval: 3         # every 3 frames
+  conf_threshold: 0.5
+  nms_threshold: 0.4
+
+recognition:
+  model_path: "models/w600k_mbf_int8.onnx"
+  backend: onnx                 # onnx / ncnn
+  recognition_threshold: 0.70
+  recognition_cooldown: 600     # unregistered retry cooldown (frames)
+  recognized_cooldown: 600      # registered re-verify cooldown (frames)
+  failed_backoff: 90
+  max_attempts: 20
+  device: cpu
+  min_face_size: 48
+  blur_threshold: 80
+  min_quality_score: 0.55
+  max_queue_size: 4
+  queue_pressure_threshold: 3
+  enable_embedding_cache: true
+  embedding_cache_ttl: 30
+  max_cache_size: 64
+
+tracking:
+  enabled: true
+  type: iou                     # IoU tracking (lightweight, no extra deps)
+  iou_threshold: 0.3
+  max_lost: 15
+  min_hits: 2
+
+pipeline:
+  window_name: "Vision AI Pi 5"
+  quit_key: "q"
+  fps_window_size: 30
+  worker_queue_size: 4
+  no_render: true               # headless by default (save GPU memory)
+
+database:
+  path: "face_db/identities.pkl"
+
+runtime:
+  mode: pi5_production
+  use_gpu: false                # no GPU on standard Pi 5
+  enable_behavior: false        # saves ~30% CPU
+  enable_region: false          # not needed for production
+  enable_reassociation: false   # not needed for production
+  enable_event_system: true     # essential for alerting
+  enable_alert: true            # essential for alerting
+
+motion:
+  threshold: 2.0                # motion sensitivity (lower = more sensitive)
+  history: 0
+  force_interval: 15            # force detection every N frames even without motion
+
+scheduler:
+  detection_interval: 3
+  force_interval: 15
+  adaptive: true
+  target_fps: 15                # Pi 5 targets 15 FPS for stable CPU usage
+  min_interval: 2
+  max_interval: 8
+  motion_boost_frames: 10
+
+behavior:
+  stationary_threshold: 60
+  loitering_threshold: 300
+  alert_cooldown: 30
+
+notification:
+  enabled: true
+  port: 8080                    # webhook server port
+  webhooks:
+    wecom: ""                   # WeCom webhook URL (configure at deploy)
+    dingtalk: ""                # DingTalk webhook URL (configure at deploy)
+  rate_limit: 60                # max notifications per minute
+
+memory:
+  max_percent: 85               # trigger memory pressure when >85% used
+  degrade_fall_interval: 30     # fall detection interval during memory pressure
+  degrade_skip_behavior: true   # skip behavior analysis under memory pressure
+
+regions: {}
+
+# === VisionTask Plugins ===
+
+tasks:
+  fall_detection:
+    enabled: true
+    backend: ncnn               # NCNN for YOLOv8n-pose (ARM NEON benefit)
+    model_path: "models/yolov8n-pose"   # NCNN: no extension (.param + .bin)
+    device: cpu
+    interval: 10                # every 10 frames (save CPU)
+    input_size: 320
+    confidence_threshold: 0.4
+
+    fall:
+      horizontal_ar_threshold: 0.6
+      angle_threshold: 120
+      torso_inclination_threshold: 65
+      min_fall_pose_duration: 3.5
+      re_threshold: 20
+      gf_threshold: 8000
+      head_descent_threshold: 0.2
+      window_size: 10
+      window_trigger_ratio: 0.5
+      min_consecutive_triggers: 3
+      min_standing_ar: 1.2
+      min_bbox_area: 3000
+      ema_alpha: 0.3
+      sg_window: 7
+      sg_polyorder: 2
+    features:
+      head_descent_window: 20
+      head_descent_min_pixels: 15
+    tracking:
+      ghost_timeout: 3.0
+      fallen_ghost_timeout: 5.0
+      distance_threshold: 150
+      history_length: 36
+    cross_camera:
+      hist_threshold: 0.5
+    camera_process:
+      roi_conf: 0.25
+      roi_enabled: true

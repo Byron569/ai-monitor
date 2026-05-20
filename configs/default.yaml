@@ -8,7 +8,9 @@ camera:
 
 detector:
   type: scrfd
-  model_name: "buffalo_s"        # InsightFace 模型包名 (buffalo_s / buffalo_l)
+  backend: onnx                  # onnx / ncnn
+  model_path: "models/scrfd_500m.onnx"
+  model_name: "buffalo_s"        # InsightFace 模型包名 (保留向后兼容)
   input_size: 640
   conf_threshold: 0.5
   nms_threshold: 0.4
@@ -17,6 +19,7 @@ detector:
 
 recognition:
   model_name: "buffalo_s"       # buffalo_s(更快) / buffalo_l(精准)
+  model_path: "models/w600k_mbf.onnx"  # ONNX 模型路径 (Phase 2)
   recognition_threshold: 0.70
   recognition_cooldown: 300     # 未识别者重试冷却 (帧)
   recognized_cooldown: 600      # 已识别者重验证冷却 (帧)
@@ -78,7 +81,32 @@ regions:
     - name: "entrance"
       points: [[150, 200], [350, 200], [350, 300], [150, 300]]
 
-# === 后续扩展预留 ===
+# === 通知服务配置 ===
+
+notification:
+  enabled: false
+  host: "0.0.0.0"
+  port: 8080
+  max_events: 1000
+  update_interval: 30
+
+  webhooks:
+    enabled: false
+    wecom_url: null           # 企业微信机器人 Webhook URL
+    dingtalk_url: null        # 钉钉机器人 Webhook URL
+    rate_limit: 60            # 默认速率限制（秒）
+    cooldowns:
+      fall_detected: 60
+      stranger_alert: 120
+      system_error: 300
+
+  email:
+    enabled: false
+    smtp_host: "smtp.qq.com"
+    smtp_port: 465
+    username: "3049169447@qq.com"
+    password: "gypvegbaxyztdgae"
+    receiver: "3049169447@qq.com"
 
 # === VisionTask Plugins ===
 
