@@ -50,11 +50,11 @@ class Camera:
         self.width = width
         self.height = height
 
-        # 在 Windows 上优先使用 DirectShow 以避免首次打开慢的问题
+        # 在 Windows 上强制使用 DirectShow（MSMF 稳定性差）
         if api is not None:
             self.cap = cv2.VideoCapture(index, api)
         else:
-            self.cap = cv2.VideoCapture(index)
+            self.cap = cv2.VideoCapture(index, cv2.CAP_DSHOW)
 
         if not self.cap.isOpened():
             raise RuntimeError(

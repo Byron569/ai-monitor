@@ -1,3 +1,4 @@
-from .face_recognizer import FaceRecognizer
+from .arcface_onnx import ArcFaceONNXRecognizer
+from .arcface_ncnn import ArcFaceNCNNRecognizer
 
-__all__ = ["FaceRecognizer"]
+__all__ = ["ArcFaceONNXRecognizer", "ArcFaceNCNNRecognizer"]

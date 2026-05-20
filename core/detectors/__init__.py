@@ -1,3 +1,5 @@
-from .scrfd_detector import SCRFDDetector
+from .scrfd_onnx import SCRFDONNXDetector as SCRFDDetector
+from .scrfd_onnx import SCRFDONNXDetector
+from .scrfd_ncnn import SCRFDNCNNDetector
 
-__all__ = ["SCRFDDetector"]
+__all__ = ["SCRFDDetector", "SCRFDONNXDetector", "SCRFDNCNNDetector"]

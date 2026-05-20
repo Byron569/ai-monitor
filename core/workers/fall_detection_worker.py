@@ -120,7 +120,7 @@ class FallDetectionWorker(threading.Thread):
         # 1. 推理
         detections = self._backend.infer(frame)
 
-        # 2. 构建检测列表
+        # 2. 构建检测列表 + IoU 去重 (避免同一人被多次检测)
         det_list = []
         if detections:
             for det in detections:
@@ -130,6 +130,18 @@ class FallDetectionWorker(threading.Thread):
                 kp_array = np.array([[kp.x, kp.y] for kp in kp_list], dtype=np.float32)
                 confs = np.array([kp.confidence for kp in kp_list], dtype=np.float32)
                 det_list.append({"bbox": det.bbox, "keypoints": kp_array.tolist(), "confs": confs})
+
+            # IoU dedup: if two detections overlap > 90%, keep the higher-confidence one
+            deduped = []
+            for d in sorted(det_list, key=lambda x: float(np.mean(x["confs"])), reverse=True):
+                dup = False
+                for m in deduped:
+                    if compute_iou(d["bbox"], m["bbox"]) > 0.9:
+                        dup = True
+                        break
+                if not dup:
+                    deduped.append(d)
+            det_list = deduped
 
         # 3. IoU 匹配 (含 ghost 继承)
         matched_ftids = set()
@@ -304,6 +316,7 @@ class FallDetectionWorker(threading.Thread):
                 stale.append(ftid)
         for ftid in stale:
             del self._fall_tracks[ftid]
+            self.last_results.pop(ftid, None)
 
     def _process_ghosts_for_test(self, frame_id, person_tracks):
         """测试辅助：当无检测时，将有跌倒嫌疑的 track 转为 ghost。"""

@@ -2,18 +2,11 @@
 
 
 def process_recognition_harvest(
-    worker, person_manager, recog_scheduler, frame_count
+    worker, person_manager, recog_scheduler, frame_count, monitor=None
 ):
-    """收割识别结果（非阻塞）—— Pipeline 和 CameraPipeline 公共逻辑。
-
-    Args:
-        worker: RecognitionWorker 实例
-        person_manager: PersonManager 实例
-        recog_scheduler: RecognitionScheduler 实例
-        frame_count: 当前帧序号
-    """
     results = worker.poll_results()
-    for tid, name, sim, emb, qs in results:
+    for tid, name, sim, emb, qs, *rest in results:
+        latency_ms = rest[0] if rest else 0.0
         if name != "Unknown" and emb is not None:
             person_manager.identify(tid, name, emb)
             recog_scheduler.mark_identified(tid, frame_count, name)
@@ -26,5 +19,5 @@ def process_recognition_harvest(
                 person_manager.cache_embedding(tid, cached_name, emb)
             else:
                 recog_scheduler.mark_completed(tid, frame_count)
-        else:
-            recog_scheduler.mark_completed(tid, frame_count)
+        if monitor is not None and latency_ms > 0:
+            monitor.track_latency("recognize", latency_ms)

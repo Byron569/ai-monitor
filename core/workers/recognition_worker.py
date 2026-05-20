@@ -10,6 +10,7 @@ RecognitionWorker v2 — 异步人脸识别工作线程（边缘优化版）。
 """
 
 import threading
+import time
 from queue import Queue, Full, Empty
 from typing import Dict, List, Tuple, Optional
 
@@ -64,12 +65,14 @@ class RecognitionWorker(threading.Thread):
             except Exception:
                 continue
 
+            t0 = time.perf_counter()
             try:
                 name, sim, emb = self._do_recognize(task.crop)
             except Exception:
                 name, sim, emb = "Unknown", 0.0, None
+            latency_ms = (time.perf_counter() - t0) * 1000.0
 
-            result = (task.track_id, name, sim, emb, task.quality_score)
+            result = (task.track_id, name, sim, emb, task.quality_score, latency_ms)
             self._output_queue.put(result)
             self._processed_count += 1
 
@@ -117,7 +120,7 @@ class RecognitionWorker(threading.Thread):
         # Check latest-result cache
         cached = self._result_cache.get(track_id)
         if cached is not None:
-            self._output_queue.put((track_id, cached[0], cached[1], cached[2], quality_score))
+            self._output_queue.put((track_id, cached[0], cached[1], cached[2], quality_score, 0.0))
             return True
 
         try:

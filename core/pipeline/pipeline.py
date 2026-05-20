@@ -27,6 +27,19 @@ from utils import FPS, PerformanceMonitor
 from utils.geometry import compute_iou
 from utils.motion_gate import MotionGate
 
+# Notification imports (optional — gracefully handled if missing)
+try:
+    from core.notification import NotificationServer
+    from core.notification.webhook import WebhookManager
+    from core.notification.email_sender import EmailNotifier
+
+    _NOTIFICATION_AVAILABLE = True
+except ImportError:
+    NotificationServer = None  # type: ignore
+    WebhookManager = None  # type: ignore
+    EmailNotifier = None  # type: ignore
+    _NOTIFICATION_AVAILABLE = False
+
 logger = logging.getLogger(__name__)
 
 ARCFACE_SRC = np.array([
@@ -44,7 +57,12 @@ def align_face(frame, landmarks, size=112):
 
 
 class Pipeline:
-    """边缘最小化人脸识别 Pipeline v9。"""
+    """边缘最小化人脸识别 Pipeline v9。
+
+    Supports optional multiprocess workers via ``recognition_process``
+    and ``fall_detection_process``.  When provided, they replace the
+    old thread-based RecognitionWorker / FallDetectionWorker.
+    """
 
     def __init__(
         self,
@@ -70,8 +88,12 @@ class Pipeline:
         quit_key: str = "q",
         no_render: bool = False,
         max_frames: int = 0,
+        overlap_threshold: float = 0.5,
         queue_pressure_threshold: int = 3,
         tasks: Optional[list] = None,
+        recognition_process: Optional[object] = None,
+        fall_detection_process: Optional[object] = None,
+        notification_config: Optional[dict] = None,
     ):
         self.camera = camera
         self.detector = detector
@@ -93,9 +115,14 @@ class Pipeline:
         self.quit_key = quit_key
         self.no_render = no_render
         self.max_frames = max_frames
+        self.overlap_threshold = overlap_threshold
         self.quality_filter = quality_filter
         self._q_pressure = queue_pressure_threshold
         self._tasks = tasks or []
+
+        # Multiprocess workers (optional, replace thread-based workers)
+        self.recognition_process = recognition_process
+        self.fall_detection_process = fall_detection_process
 
         self._frame_count = 0
         self._running = False
@@ -105,6 +132,16 @@ class Pipeline:
         self._overlap_start: Dict[tuple, int] = {}
         self._separation_time: Dict[tuple, int] = {}
 
+        # Ring-buffer slot counters for process-based workers
+        self._recog_slot: int = 0
+        self._fall_slot: int = 0
+
+        # Cache of fall-detection results from ``fall_detection_process``
+        self._fall_results: dict = {}
+
+        # Alive-check throttle
+        self._last_alive_check: float = 0.0
+
         # 初始化阶段确定开关，避免每帧重复判断
         self._behavior_enabled = (
             self.trajectory_analyzer is not None
@@ -112,6 +149,60 @@ class Pipeline:
             or self.region_manager is not None
             or self.event_system is not None
         )
+
+        # Notification system (optional)
+        self.notification_server = None
+        self.webhook_manager = None
+        self.email_notifier = None
+        self._notification_update_interval = 30  # frames
+        if notification_config and notification_config.get("enabled", False):
+            if _NOTIFICATION_AVAILABLE:
+                try:
+                    host = notification_config.get("host", "0.0.0.0")
+                    port = int(notification_config.get("port", 8080))
+                    max_events = int(notification_config.get("max_events", 1000))
+                    self.notification_server = NotificationServer(
+                        host=host, port=port, max_events=max_events,
+                    )
+                    logger.info(
+                        "[Pipeline] NotificationServer configured on %s:%s", host, port
+                    )
+
+                    webhook_cfg = notification_config.get("webhooks", {})
+                    wh_enabled = webhook_cfg.get("enabled", False)
+                    wh_config = {
+                        "wecom": webhook_cfg.get("wecom_url"),
+                        "dingtalk": webhook_cfg.get("dingtalk_url"),
+                        "rate_limit": webhook_cfg.get("rate_limit", 60),
+                        "cooldowns": webhook_cfg.get("cooldowns", {}),
+                    }
+                    if wh_enabled and (wh_config["wecom"] or wh_config["dingtalk"]):
+                        self.webhook_manager = WebhookManager(wh_config)
+                        logger.info("[Pipeline] WebhookManager initialized")
+
+                    email_cfg = notification_config.get("email", {})
+                    if email_cfg.get("enabled", False):
+                        self.email_notifier = EmailNotifier(
+                            smtp_host=email_cfg.get("smtp_host", "smtp.qq.com"),
+                            smtp_port=int(email_cfg.get("smtp_port", 465)),
+                            username=email_cfg.get("username", ""),
+                            password=email_cfg.get("password", ""),
+                            receiver=email_cfg.get("receiver", ""),
+                        )
+                        logger.info("[Pipeline] EmailNotifier configured")
+
+                    self._notification_update_interval = int(
+                        notification_config.get("update_interval", 30)
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "[Pipeline] Failed to init notification: %s", exc
+                    )
+            else:
+                logger.info(
+                    "[Pipeline] notification config provided but dependencies "
+                    "not installed (pip install fastapi uvicorn requests)"
+                )
 
     # ------------------------------------------------------------------
     # 主循环
@@ -121,10 +212,26 @@ class Pipeline:
         self._running = True
         self.worker.start()
 
+        # Start multiprocess workers if provided
+        if self.recognition_process is not None:
+            self.recognition_process.start()
+            logger.info("[Pipeline] RecognitionProcess started")
+        if self.fall_detection_process is not None:
+            self.fall_detection_process.start()
+            logger.info("[Pipeline] FallDetectionProcess started")
+
+        # Start notification server if configured
+        if self.notification_server is not None:
+            self.notification_server.start()
+
         print("=" * 60)
         print("  Pipeline v9 | Edge-Minimal Pipeline")
         print(f"  Detect: {self.frame_scheduler.detection_interval}f | Motion: {self.motion_gate.threshold}")
         print(f"  Behavior: {'ON' if self._behavior_enabled else 'OFF'}")
+        if self.recognition_process is not None:
+            print("  Recognition: Process-based")
+        if self.fall_detection_process is not None:
+            print("  Fall Detection: Process-based")
         print("=" * 60)
 
         with self.camera as cam:
@@ -143,6 +250,14 @@ class Pipeline:
                 self._process_recognition(frame)
                 self._run_tasks(frame, active_tracks)
 
+                # --- Notification status update (every N frames) ------------
+                if self.notification_server is not None and self._frame_count % self._notification_update_interval == 0:
+                    self._update_notification_status(active_tracks)
+
+                # Periodic alive check for multiprocess workers
+                if self._frame_count % 30 == 0:
+                    self._check_processes_alive()
+
                 if not self.no_render:
                     self._render(frame, motion_active, motion_score, reason)
                     cv2.imshow(self.window_name, frame)
@@ -157,6 +272,7 @@ class Pipeline:
                     self._running = False
 
         self.worker.stop()
+        self._stop_processes()
         print(f"[Pipeline] 已退出 (共 {self._frame_count} 帧)")
 
     # ------------------------------------------------------------------
@@ -216,6 +332,11 @@ class Pipeline:
             self.person_manager.get_or_create(tid, (x1, y1, x2, y2))
         if detections:
             self._update_landmarks_cache(detections, active_tracks)
+        # Prune stale entries from landmarks cache
+        active_ids = set(active_tracks.keys())
+        stale = [tid for tid in self._landmarks_cache if tid not in active_ids]
+        for tid in stale:
+            del self._landmarks_cache[tid]
         self.person_manager.cleanup()
 
     # ------------------------------------------------------------------
@@ -242,7 +363,7 @@ class Pipeline:
                 tid_b, pb = active_list[j]
                 overlap = compute_iou(pa.bbox, pb.bbox)
                 key = (min(tid_a, tid_b), max(tid_a, tid_b))
-                if overlap > 0.3:
+                if overlap > self.overlap_threshold:
                     if key not in self._overlap_start:
                         self._overlap_start[key] = self._frame_count
                         self.person_manager.reset_identity(tid_a)
@@ -305,6 +426,51 @@ class Pipeline:
             if events and self.alert_manager:
                 self.alert_manager.process(events)
 
+            # --- Push events to notification server + webhook ----------------
+            if events:
+                for evt in events:
+                    evt_type = getattr(evt, "event_type", None) or getattr(evt, "type", None)
+                    if not evt_type:
+                        continue
+
+                    # Push to notification server event buffer
+                    if self.notification_server is not None:
+                        ts = getattr(evt, "timestamp", time.time())
+                        person = self.person_manager.get(getattr(evt, "track_id", 0))
+                        evt_name = getattr(person, "identity", "Unknown") if person else "Unknown"
+                        self.notification_server.push_event({
+                            "ts": ts if isinstance(ts, (int, float)) else time.time(),
+                            "type": evt_type,
+                            "level": "fall" if "fall" in str(evt_type).lower() else "info",
+                            "msg": f"[{evt_type}] {evt_name}",
+                        })
+
+                    # Send webhook for fall events
+                    if self.webhook_manager is not None and (
+                        "fall" in str(evt_type).lower()
+                        or "stranger" in str(evt_type).lower()
+                    ):
+                        person = self.person_manager.get(getattr(evt, "track_id", 0))
+                        name = getattr(person, "identity", "Unknown") if person else "Unknown"
+                        confidence = getattr(evt, "confidence", 0.0)
+                        self.webhook_manager.send_event(
+                            event_type="fall_detected" if "fall" in str(evt_type).lower() else "stranger_alert",
+                            name=name,
+                            camera_id="cam0",
+                            confidence=float(confidence) if confidence else 0.0,
+                        )
+
+                    # Send email for fall events
+                    if self.email_notifier is not None and "fall" in str(evt_type).lower():
+                        from core.notification.email_sender import format_fall_email
+
+                        subject, body = format_fall_email(
+                            name=name,
+                            camera_id="cam0",
+                            confidence=float(confidence) if confidence else 0.0,
+                        )
+                        self.email_notifier.send_alert(subject, body)
+
     # ------------------------------------------------------------------
     # Landmarks cache
     # ------------------------------------------------------------------
@@ -335,64 +501,151 @@ class Pipeline:
 
     def _process_recognition(self, frame: np.ndarray) -> None:
         active = list(self.person_manager.get_active().values())
-        queue_pressure = self.worker.queue_size >= self._q_pressure
-        target = self.recog_scheduler.get_next(active, self._frame_count, queue_pressure)
 
-        if target is not None:
-            tid = target.track_id
-            x1, y1, x2, y2 = target.bbox
+        # --- Process-based path (multiprocess worker) ----------------------
+        if self.recognition_process is not None:
+            self._recognition_submit_process(frame, active)
+            self._recognition_harvest_process()
+        else:
+            # --- Thread-based path (legacy RecognitionWorker) --------------
+            queue_pressure = self.worker.queue_size >= self._q_pressure
+            target = self.recog_scheduler.get_next(active, self._frame_count, queue_pressure)
 
-            # Check embedding cache first
-            cached = self.person_manager.lookup_embedding(tid)
-            if cached is not None:
-                cached_name, cached_emb = cached
-                if cached_name != "Unknown":
-                    self.person_manager.identify(tid, cached_name, cached_emb)
-                    self.recog_scheduler.mark_identified(tid, self._frame_count, cached_name)
-                    self.monitor.inc("recog_cache_hit")
+            if target is not None:
+                tid = target.track_id
+                x1, y1, x2, y2 = target.bbox
+
+                # Check embedding cache first
+                cached = self.person_manager.lookup_embedding(tid)
+                if cached is not None:
+                    cached_name, cached_emb = cached
+                    if cached_name != "Unknown":
+                        self.person_manager.identify(tid, cached_name, cached_emb)
+                        self.recog_scheduler.mark_identified(tid, self._frame_count, cached_name)
+                        self.monitor.inc("recog_cache_hit")
+                        # cache hit: still need dedup/cleanup below
+                        self._recognition_post_harvest()
+                        return
+
+                if y2 <= y1 or x2 <= x1:
                     return
 
-            if y2 <= y1 or x2 <= x1:
-                return
+                # Face quality filter
+                quality_result = None
+                if self.quality_filter:
+                    quality_result = self.quality_filter.evaluate(frame, target.bbox)
+                    if not quality_result.passed:
+                        self.monitor.inc("recog_quality_reject")
+                        return
 
-            # Face quality filter
-            quality_result = None
-            if self.quality_filter:
-                quality_result = self.quality_filter.evaluate(frame, target.bbox)
-                if not quality_result.passed:
-                    self.monitor.inc("recog_quality_reject")
+                qs = quality_result.score if quality_result else 0.5
+
+                # Crop and submit
+                kps = self._landmarks_cache.get(tid)
+                crop = None
+                if kps is not None:
+                    aligned = align_face(frame, kps, size=112)
+                    if aligned is not None and aligned.size > 0:
+                        crop = aligned
+
+                if crop is None:
+                    crop = frame[y1:y2, x1:x2]
+
+                if crop.size == 0:
                     return
 
-            qs = quality_result.score if quality_result else 0.5
+                force = (quality_result is not None and quality_result.score > 0.8)
+                if self.worker.submit(tid, crop, quality_score=qs, force=force):
+                    self.recog_scheduler.mark_submitted(tid)
+                    self.monitor.inc("recog_enqueue")
+                    self.monitor.set_gauge("recog_queue_size", self.worker.queue_size)
+                else:
+                    self.monitor.inc("recog_skip")
 
-            # Crop and submit
-            kps = self._landmarks_cache.get(tid)
-            crop = None
-            if kps is not None:
-                aligned = align_face(frame, kps, size=112)
-                if aligned is not None and aligned.size > 0:
-                    crop = aligned
+            # Harvest results
+            process_recognition_harvest(
+                self.worker, self.person_manager, self.recog_scheduler,
+                self._frame_count, self.monitor,
+            )
 
-            if crop is None:
-                crop = frame[y1:y2, x1:x2]
+        # --- Common: hard dedup + scheduler cleanup -----------------------
+        self._recognition_post_harvest()
 
-            if crop.size == 0:
+    def _recognition_submit_process(self, frame: np.ndarray, active: list) -> None:
+        """Submit a face recognition task to the multiprocess worker via SHM."""
+        target = self.recog_scheduler.get_next(active, self._frame_count, queue_pressure=False)
+
+        if target is None:
+            return
+
+        tid = target.track_id
+        x1, y1, x2, y2 = target.bbox
+
+        # Check embedding cache first
+        cached = self.person_manager.lookup_embedding(tid)
+        if cached is not None:
+            cached_name, cached_emb = cached
+            if cached_name != "Unknown":
+                self.person_manager.identify(tid, cached_name, cached_emb)
+                self.recog_scheduler.mark_identified(tid, self._frame_count, cached_name)
+                self.monitor.inc("recog_cache_hit")
                 return
 
-            force = (quality_result is not None and quality_result.score > 0.8)
-            if self.worker.submit(tid, crop, quality_score=qs, force=force):
-                self.recog_scheduler.mark_submitted(tid)
-                self.monitor.inc("recog_enqueue")
-                self.monitor.set_gauge("recog_queue_size", self.worker.queue_size)
+        if y2 <= y1 or x2 <= x1:
+            return
+
+        # Quality filter
+        quality_result = None
+        if self.quality_filter:
+            quality_result = self.quality_filter.evaluate(frame, target.bbox)
+            if not quality_result.passed:
+                self.monitor.inc("recog_quality_reject")
+                return
+
+        kps_list = None
+        kps = self._landmarks_cache.get(tid)
+        if kps is not None:
+            kps_list = kps.tolist()
+
+        h, w = frame.shape[:2]
+        slot = self._recog_slot % self.recognition_process.N_SLOTS
+        self._recog_slot += 1
+
+        self.recognition_process.submit_frame(frame, slot_idx=slot, meta={
+            "tid": tid,
+            "bbox": [x1, y1, x2, y2],
+            "landmarks": kps_list,
+            "frame_h": h,
+            "frame_w": w,
+        })
+        self.recog_scheduler.mark_submitted(tid)
+        self.monitor.inc("recog_enqueue")
+
+    def _recognition_harvest_process(self) -> None:
+        """Poll results from the multiprocess recognition worker."""
+        for result in self.recognition_process.poll_results():
+            tid = result.get("tid")
+            embedding_list = result.get("embedding")
+
+            if tid is None:
+                continue
+
+            if embedding_list and isinstance(embedding_list, list):
+                emb = np.array(embedding_list, dtype=np.float32)
+                name, _ = self.person_manager.find_cached_identity(emb)
+                if name is not None:
+                    self.person_manager.identify(tid, name, emb)
+                    self.recog_scheduler.mark_identified(
+                        tid, self._frame_count, name
+                    )
+                    self.person_manager.cache_embedding(tid, name, emb)
+                else:
+                    self.recog_scheduler.mark_completed(tid, self._frame_count)
             else:
-                self.monitor.inc("recog_skip")
+                self.recog_scheduler.mark_completed(tid, self._frame_count)
 
-        # Harvest results
-        process_recognition_harvest(
-            self.worker, self.person_manager, self.recog_scheduler,
-            self._frame_count,
-        )
-
+    def _recognition_post_harvest(self) -> None:
+        """Hard dedup and scheduler cleanup (common to both paths)."""
         # Hard dedup: one registered name max
         seen: Dict[str, int] = {}
         for tid, person in self.person_manager.get_active().items():
@@ -421,6 +674,10 @@ class Pipeline:
         }
 
     def _run_tasks(self, frame, active_tracks) -> None:
+        # --- Fall detection process: submit frame + poll results -----------
+        if self.fall_detection_process is not None:
+            self._fall_detection_submit_and_poll(frame, active_tracks)
+
         if not self._tasks:
             return
 
@@ -435,6 +692,15 @@ class Pipeline:
         for task in self._tasks:
             if not task.enabled:
                 continue
+
+            # --- Process-based fall detection: skip task inference when using process
+            if self._is_fall_task(task):
+                if self.fall_detection_process is not None:
+                    if self._fall_results:
+                        task.last_results = self._fall_results
+                    continue
+                # No process available — let task run normally below
+
             try:
                 if not task.should_run(self._frame_count, tracks, ctx):
                     continue
@@ -458,25 +724,47 @@ class Pipeline:
                         **(evt.payload),
                     )
 
+    @staticmethod
+    def _is_fall_task(task) -> bool:
+        """Check whether a task is a fall detection task.
+
+        When the ``fall_detection_process`` is active, these tasks should
+        skip their own inference and use the process results instead.
+        """
+        name = getattr(task, "name", "").lower()
+        return "fall" in name or "pose" in name or "detection" in name
+
+    def _fall_detection_submit_and_poll(self, frame, active_tracks) -> None:
+        """Submit frame to fall detection process and poll results."""
+        h, w = frame.shape[:2]
+        tracks = []
+        for tid, bbox in active_tracks.items():
+            person = self.person_manager.get(tid)
+            ident = person.identity if person else "Unknown"
+            tracks.append((tid, list(bbox), ident))
+
+        slot = self._fall_slot % self.fall_detection_process.N_SLOTS
+        self._fall_slot += 1
+
+        self.fall_detection_process.submit_frame(frame, slot_idx=slot, meta={
+            "frame_id": self._frame_count,
+            "tracks": tracks,
+            "frame_h": h,
+            "frame_w": w,
+        })
+
+        # Poll results
+        for result in self.fall_detection_process.poll_results():
+            fall_events = result.get("fall_events", {})
+            if fall_events:
+                self._fall_results = fall_events
+
     # ------------------------------------------------------------------
     # Render
     # ------------------------------------------------------------------
 
     def _render(self, frame, motion_active, motion_score, reason):
-        # 硬去重：注册用户只保留第一个框
-        seen_names = set()
-        for tid, person in list(self.person_manager.get_active().items()):
-            if person.is_identified and person.identity != "Unknown":
-                if person.identity in seen_names:
-                    self.person_manager.reset_identity(tid)
-                    self.recog_scheduler.force_recognize(tid)
-                    self.recog_scheduler.mark_completed(tid, self._frame_count)
-                    st = self.recog_scheduler._states.get(tid)
-                    if st:
-                        st.last_attempt = self._frame_count + 600
-                    continue
-                seen_names.add(person.identity)
-
+        # Dedup is handled in _recognition_post_harvest — render only draws.
         for tid, person in self.person_manager.get_active().items():
             if person.frame_seen < 3:
                 continue
@@ -492,11 +780,21 @@ class Pipeline:
 
         # 绘制摔倒检测结果 (人体框 + 骨架 + 状态)
         fall_count = 0
-        for task in self._tasks:
-            if not task.enabled:
-                continue
-            results = getattr(task, "last_results", {})
-            for tid, result in results.items():
+
+        # Fall-detection results (process-based or task-based)
+        all_fall_results = {}
+        if self.fall_detection_process is not None:
+            all_fall_results = self._fall_results
+        else:
+            for task in self._tasks:
+                if not task.enabled:
+                    continue
+                results = getattr(task, "last_results", {})
+                all_fall_results.update(results)
+
+        for tid, result in all_fall_results.items():
+                if result.get("is_ghost"):
+                    continue  # skip ghost tracks — don't render stale boxes
                 body_bbox = result.get("bbox")
                 if body_bbox:
                     self.renderer.draw_body_bbox(frame, body_bbox)
@@ -516,11 +814,17 @@ class Pipeline:
         self.fps.update()
         self.renderer.draw_fps(frame, self.fps.get_fps())
 
+        # 识别队列信息 (process-based or thread-based)
+        if self.recognition_process is not None:
+            q_info = "MP"
+        else:
+            q_info = str(self.worker.queue_size)
+
         motion_str = f"{motion_score:.1f}({'Y' if motion_active else 'N'})"
         info_lines = [
             f"Persons: {self.person_manager.stable_count} | Lost: {self._track_memory.lost_count}",
             f"Fall: {fall_count} alert(s) | Motion: {motion_str} | {reason}",
-            f"Frame: #{self._frame_count} | Q: {self.worker.queue_size} | Cache: {self.person_manager.cache_size}",
+            f"Frame: #{self._frame_count} | Q: {q_info} | Cache: {self.person_manager.cache_size}",
             self.monitor.report(),
         ]
 
@@ -530,5 +834,87 @@ class Pipeline:
 
         self.renderer.draw_system_info(frame, info_lines)
 
+    def _check_processes_alive(self) -> None:
+        """Periodic alive-check with auto-restart for multiprocess workers."""
+        if self.recognition_process is not None:
+            self.recognition_process.check_alive()
+        if self.fall_detection_process is not None:
+            self.fall_detection_process.check_alive()
+
+    def _stop_processes(self) -> None:
+        """Gracefully stop all multiprocess workers."""
+        if self.recognition_process is not None:
+            try:
+                self.recognition_process.stop()
+                logger.info("[Pipeline] RecognitionProcess stopped")
+            except Exception as exc:
+                logger.warning("[Pipeline] Error stopping RecognitionProcess: %s", exc)
+
+        if self.fall_detection_process is not None:
+            try:
+                self.fall_detection_process.stop()
+                logger.info("[Pipeline] FallDetectionProcess stopped")
+            except Exception as exc:
+                logger.warning("[Pipeline] Error stopping FallDetectionProcess: %s", exc)
+
+    def _update_notification_status(self, active_tracks: dict) -> None:
+        """Push current pipeline status to the notification server."""
+        if self.notification_server is None:
+            return
+
+        try:
+            # Count fall alerts from fall detection results
+            fall_count = 0
+            all_fall = {}
+            if self.fall_detection_process is not None:
+                all_fall = self._fall_results
+            else:
+                for task in self._tasks:
+                    results = getattr(task, "last_results", {})
+                    all_fall.update(results)
+            for result in all_fall.values():
+                if result.get("fall_state", "") not in ("Normal", ""):
+                    fall_count += 1
+
+            fps_val = self.fps.get_fps()
+            stable_count = self.person_manager.stable_count if self.person_manager else 0
+            self.notification_server.update_status(
+                fps=round(fps_val, 1),
+                persons=stable_count,
+                fall_alerts=fall_count,
+                mem_percent="0%",
+            )
+
+            # Person list
+            persons_list = []
+            for tid, person in self.person_manager.get_active().items():
+                entry = {
+                    "track_id": tid,
+                    "name": person.identity if person.is_identified else "Unknown",
+                    "behavior": getattr(person, "behavior", "-"),
+                    "fall_state": "Normal",
+                }
+                persons_list.append(entry)
+
+            # Enrich with fall state from detection results
+            for tid_str, result in all_fall.items():
+                try:
+                    tid = int(tid_str)
+                    for p in persons_list:
+                        if p["track_id"] == tid:
+                            p["fall_state"] = result.get("fall_state", "Normal")
+                except (ValueError, TypeError):
+                    pass
+
+            self.notification_server.update_persons(persons_list)
+        except Exception as exc:
+            logger.debug("[Pipeline] notification update error: %s", exc)
+
     def stop(self) -> None:
         self._running = False
+        if self.notification_server is not None:
+            try:
+                self.notification_server.stop()
+                logger.info("[Pipeline] NotificationServer stopped")
+            except Exception as exc:
+                logger.warning("[Pipeline] Error stopping NotificationServer: %s", exc)
